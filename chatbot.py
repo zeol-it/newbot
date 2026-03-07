@@ -259,10 +259,17 @@ def detect_injection(text: str) -> bool:
 class IRCBot:
     logger = logging.getLogger("chatbot.IRCBot")
 
+    RECONNECT_DELAY = 5      # seconds between attempts on the same server
+    RECONNECT_MAX_DELAY = 60  # cap for exponential backoff
+
     def __init__(self, config):
         self.admin_prompt = config["admin_prompt"]
-        self.server = config["server"]
-        self.port = config["port"]
+        # Support both old single-server format and new list format
+        if "servers" in config:
+            self.servers = config["servers"]  # [{"host": ..., "port": ...}, ...]
+        else:
+            self.servers = [{"host": config["server"], "port": config["port"]}]
+        self._server_index = 0
         self.source_ip = config["source_ip"]
         self.nickname = config["nickname"]
         self.channels = config["channels"]
@@ -271,6 +278,7 @@ class IRCBot:
         self.chat_params = config["chat_params"]
         self.chatgpt_bot = ChatGPTBot(config["openai_api_key"], config["admin_prompt"], config["chat_params"])
         self.irc = None
+        self._connected = False
 
     def update_config(self, new_config):
         """Update bot configuration dynamically."""
@@ -281,33 +289,63 @@ class IRCBot:
         if "openai_api_key" in new_config:
             self.chatgpt_bot = ChatGPTBot(new_config["openai_api_key"], self.admin_prompt)
 
-    def connect(self):
-        while True:
+    def _next_server(self):
+        """Rotate to the next server in the list (round-robin)."""
+        self._server_index = (self._server_index + 1) % len(self.servers)
+
+    def _close_socket(self):
+        """Safely close the current IRC socket."""
+        if self.irc:
             try:
-                self.logger.info(f"Connecting to {self.server}:{self.port} from {self.source_ip}...")
-                self.irc = socket.socket(socket.AF_INET6 if ":" in self.source_ip else socket.AF_INET, socket.SOCK_STREAM)
+                self.irc.close()
+            except Exception:
+                pass
+            self.irc = None
+        self._connected = False
+
+    def connect(self):
+        """Try each server in round-robin until one succeeds, with exponential backoff."""
+        delay = self.RECONNECT_DELAY
+        attempt = 0
+        while True:
+            srv = self.servers[self._server_index]
+            host, port = srv["host"], srv["port"]
+            try:
+                self.logger.info(f"Connecting to {host}:{port} from {self.source_ip} "
+                                 f"(server {self._server_index + 1}/{len(self.servers)})...")
+                self._close_socket()
+                self.irc = socket.socket(
+                    socket.AF_INET6 if ":" in self.source_ip else socket.AF_INET,
+                    socket.SOCK_STREAM
+                )
                 self.irc.bind((self.source_ip, 0))
-                self.irc.connect((self.server, self.port))
+                self.irc.connect((host, port))
 
                 if self.usessl:
-                    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                    context.check_hostname = False
-                    context.verify_mode = ssl.CERT_NONE
-                    self.irc = context.wrap_socket(self.irc, server_hostname=self.server)
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    self.irc = ctx.wrap_socket(self.irc, server_hostname=host)
 
                 if self.password:
                     self.send(f"PASS {self.password}")
-                    self.send(f"NICK {self.nickname}")
+                self.send(f"NICK {self.nickname}")
                 self.send(f"USER {self.nickname} 0 * :{self.nickname}")
 
                 for channel in self.channels:
                     self.send(f"JOIN {channel}")
 
-                self.logger.info(f"Connected to {self.server}:{self.port}")
-                break
+                self.logger.info(f"Connected to {host}:{port}")
+                self._connected = True
+                delay = self.RECONNECT_DELAY  # reset backoff on success
+                return
             except Exception as e:
-                self.logger.error(f"Connection failed: {e}. Retrying in 5 seconds...")
-                time.sleep(5)
+                self.logger.error(f"Connection to {host}:{port} failed: {e}. "
+                                  f"Trying next server in {delay}s...")
+                self._next_server()
+                attempt += 1
+                time.sleep(delay)
+                delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
 
     def send(self, message):
         self.irc.send((message + "\r\n").encode("utf-8"))
@@ -335,8 +373,9 @@ class IRCBot:
                 self.handle_message(line)
 
             except Exception as e:
-                self.logger.error(f"Error receiving message: {e}")
-                #self.connect()
+                self.logger.error(f"Connection lost: {e}")
+                self._connected = False
+                raise  # propagate to run() to trigger reconnect
 
     def sanitize_prompt(self, user, text):
         """
@@ -459,9 +498,14 @@ class IRCBot:
                     break
 
     def run(self):
-        self.connect()
-        listener_thread = threading.Thread(target=self.listen)
-        listener_thread.start()
+        """Connect and keep reconnecting on disconnect."""
+        while True:
+            self.connect()
+            try:
+                self.listen()
+            except Exception:
+                self.logger.info("Reconnecting...")
+                self._close_socket()
 
 if __name__ == "__main__":
     bot = IRCBot(config)
