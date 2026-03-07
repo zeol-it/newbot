@@ -69,8 +69,9 @@ def start_config_watcher(config_path, callback):
 
 # Initialize ChatGPT context per user
 class ChatGPTBot:
-    def __init__(self, api_key, admin_prompt, chat_params):
+    def __init__(self, api_key, admin_prompt, model, chat_params):
         self.chat_params = chat_params
+        self.model = model
         openai.api_key = api_key  # Set the OpenAI API key globally
         self.admin_prompt = {"role": "system", "content": admin_prompt}  # Administrative prompt
         self.user_context = defaultdict(list)
@@ -78,11 +79,9 @@ class ChatGPTBot:
         # Ensure the administrative prompt is included at the start of every interaction
         context = [self.admin_prompt] + self.user_context[user]
         context.append({"role": "user", "content": message})
-        #print(f"Got chat params {self.chat_params[]}")
 
         response = openai.ChatCompletion.create(
-            model="gpt-4.1",
-                        #model="o4-mini",
+            model=self.model,
             messages=context,
             temperature =  self.chat_params["temperature"],
             max_completion_tokens = self.chat_params["max_tokens"],
@@ -276,7 +275,7 @@ class IRCBot:
         self.usessl = config["usessl"]
         self.password = config.get("password")
         self.chat_params = config["chat_params"]
-        self.chatgpt_bot = ChatGPTBot(config["openai_api_key"], config["admin_prompt"], config["chat_params"])
+        self.chatgpt_bot = ChatGPTBot(config["openai_api_key"], config["admin_prompt"], config["model"], config["chat_params"])
         self.irc = None
         self._connected = False
 
@@ -285,9 +284,14 @@ class IRCBot:
         self.logger.info("Updating configuration...")
         self.config = new_config
 
-        # Reinitialize ChatGPT bot if the API key changes
-        if "openai_api_key" in new_config:
-            self.chatgpt_bot = ChatGPTBot(new_config["openai_api_key"], self.admin_prompt)
+        # Reinitialize ChatGPT bot if the API key or model changes
+        if "openai_api_key" in new_config or "model" in new_config:
+            self.chatgpt_bot = ChatGPTBot(
+                new_config.get("openai_api_key", self.chatgpt_bot.model),
+                self.admin_prompt,
+                new_config.get("model", self.chatgpt_bot.model),
+                new_config.get("chat_params", self.chat_params),
+            )
 
     def _next_server(self):
         """Rotate to the next server in the list (round-robin)."""
