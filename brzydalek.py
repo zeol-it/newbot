@@ -96,7 +96,7 @@ class ChannelHistory:
         while len(self._messages) > self.max_messages:
             self._messages.popleft()
 
-    def get_context_lines(self, now: float | None = None) -> list[str]:
+    def get_context_lines(self, now=None) -> list:
         """Return lines formatted as '<nick> text' within the time window."""
         if now is None:
             now = time.time()
@@ -322,7 +322,7 @@ class IRCBot:
         self._connected = False
         # Per-channel spontaneous message config and history
         self._spontaneous_cfg: dict = {}   # channel -> cfg dict
-        self._channel_history: dict[str, ChannelHistory] = {}  # channel -> ChannelHistory
+        self._channel_history = {}  # channel -> ChannelHistory
         self._spontaneous_next: dict[str, float] = {}  # channel -> next fire timestamp
         self._reload_spontaneous_config(config)
 
