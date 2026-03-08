@@ -461,16 +461,23 @@ class IRCBot:
     def update_config(self, new_config):
         """Update bot configuration dynamically."""
         self.logger.info("Updating configuration...")
-        self.config = new_config
 
-        # Reinitialize ChatGPT bot if the API key or model changes
-        if "openai_api_key" in new_config or "model" in new_config:
-            self.chatgpt_bot = ChatGPTBot(
-                new_config.get("openai_api_key", self.chatgpt_bot.model),
-                self.admin_prompt,
-                new_config.get("model", self.chatgpt_bot.model),
-                new_config.get("chat_params", self.chat_params),
+        # Reinitialize ChatGPT bot if the API key, model or chat_params change
+        new_bot = ChatGPTBot(
+            new_config.get("openai_api_key", self.chatgpt_bot._client.api_key),
+            new_config.get("admin_prompt", self.admin_prompt),
+            new_config.get("model", self.chatgpt_bot.model),
+            new_config.get("chat_params", self.chatgpt_bot.chat_params),
+        )
+        try:
+            new_bot.validate_api()
+        except Exception as e:
+            self.logger.error(
+                f"Config reload aborted — OpenAI API validation failed: {e}"
             )
+            return
+        self.chatgpt_bot = new_bot
+        self.config = new_config
         self._reload_spontaneous_config(new_config)
 
     def _next_server(self):
@@ -672,7 +679,12 @@ class IRCBot:
                 self.logger.debug(f"Prompt split into {len(chunks)} chunks for ChatGPT")
 
             self.logger.debug(f"Querying ChatGPT for {user}...")
-            responses = [self.chatgpt_bot.respond(user, chunk) for chunk in chunks]
+            try:
+                responses = [self.chatgpt_bot.respond(user, chunk) for chunk in chunks]
+            except Exception as e:
+                self.logger.error(f"OpenAI API error for {user}: {e}")
+                self.send(f"PRIVMSG {channel} :{user}: [błąd API: {e}]")
+                return
             response = ' '.join(responses).replace('\n', ' ').strip()
             self.logger.debug(f"ChatGPT response for {user}: {response!r}")
 
