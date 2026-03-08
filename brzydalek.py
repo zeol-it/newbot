@@ -363,18 +363,19 @@ class IRCBot:
                 buffer = lines.pop()
 
                 for line in lines:
-                    self.logger.debug(f"< {line}")
                     if line.startswith("PING"):
                         server = line.split()[1]
                         self.logger.debug(f"PONG {server}")
                         self.send(f"PONG {server}")
+                    else:
+                        self.logger.debug(f"< {line}")
                     if "INVITE" in line:
                         parts = line.split()
                         inviter = parts[0][1:].split("!")[0]  # Extract inviter's nickname
                         channel = parts[3][1:]  # Extract channel name
                         self.logger.info(f"Invited by {inviter} to join {channel}")
                         self.send(f"JOIN {channel}")
-                self.handle_message(line)
+                    self.handle_message(line)
 
             except Exception as e:
                 self.logger.error(f"Connection lost: {e}")
