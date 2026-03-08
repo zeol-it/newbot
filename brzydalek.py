@@ -8,11 +8,11 @@ except ImportError:
 import ssl
 import time
 import json
+import random
 import logging
 import openai
 import threading
-import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -65,6 +65,48 @@ def start_config_watcher(config_path, callback):
     observer_thread.daemon = True
     observer_thread.start()
     return observer
+
+
+# ---------------------------------------------------------------------------
+# Per-channel message history (rolling time window)
+# ---------------------------------------------------------------------------
+
+class ChannelHistory:
+    """
+    Stores the last `max_window` seconds of PRIVMSG activity for a channel.
+    Each entry is a dict: {"ts": float, "nick": str, "text": str}.
+    """
+
+    def __init__(self, max_window: int = 7200, max_messages: int = 200):
+        self.max_window = max_window      # seconds to keep (default 2 h)
+        self.max_messages = max_messages  # hard cap on stored messages
+        self._messages: deque = deque()
+        self._lock = threading.Lock()
+
+    def add(self, nick: str, text: str) -> None:
+        now = time.time()
+        with self._lock:
+            self._messages.append({"ts": now, "nick": nick, "text": text})
+            self._prune(now)
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.max_window
+        while self._messages and self._messages[0]["ts"] < cutoff:
+            self._messages.popleft()
+        while len(self._messages) > self.max_messages:
+            self._messages.popleft()
+
+    def get_context_lines(self, now: float | None = None) -> list[str]:
+        """Return lines formatted as '<nick> text' within the time window."""
+        if now is None:
+            now = time.time()
+        with self._lock:
+            self._prune(now)
+            return [f"<{m['nick']}> {m['text']}" for m in self._messages]
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._messages)
 
 
 # Initialize ChatGPT context per user
@@ -278,6 +320,92 @@ class IRCBot:
         self.chatgpt_bot = ChatGPTBot(config["openai_api_key"], config["admin_prompt"], config["model"], config["chat_params"])
         self.irc = None
         self._connected = False
+        # Per-channel spontaneous message config and history
+        self._spontaneous_cfg: dict = {}   # channel -> cfg dict
+        self._channel_history: dict[str, ChannelHistory] = {}  # channel -> ChannelHistory
+        self._spontaneous_next: dict[str, float] = {}  # channel -> next fire timestamp
+        self._reload_spontaneous_config(config)
+
+    def _reload_spontaneous_config(self, cfg: dict) -> None:
+        """Parse per-channel spontaneous message settings from config."""
+        raw: dict = cfg.get("spontaneous", {})
+        new_cfg: dict = {}
+        for channel, opts in raw.items():
+            if not opts.get("enabled", False):
+                continue
+            new_cfg[channel] = {
+                "enabled": True,
+                "history_window": int(opts.get("history_window", 7200)),
+                "min_interval": int(opts.get("min_interval", 1800)),
+                "max_interval": int(opts.get("max_interval", 3600)),
+                "min_messages": int(opts.get("min_messages", 5)),
+                "prompt": opts.get(
+                    "prompt",
+                    "Jesteś uczestnikiem rozmowy na IRC. Na podstawie poniższej historii "
+                    "wiadomości napisz jedną krótką, spontaniczną wiadomość pasującą do "
+                    "kontekstu. Odpowiedz TYLKO treścią wiadomości, bez żadnych "
+                    "dodatkowych komentarzy.",
+                ),
+            }
+            # Create or resize ChannelHistory
+            window = new_cfg[channel]["history_window"]
+            if channel not in self._channel_history:
+                self._channel_history[channel] = ChannelHistory(max_window=window)
+            else:
+                self._channel_history[channel].max_window = window
+            # Schedule first fire only if not already scheduled
+            if channel not in self._spontaneous_next:
+                self._schedule_next(channel, new_cfg[channel])
+        self._spontaneous_cfg = new_cfg
+        self.logger.info(f"Spontaneous config loaded for channels: {list(new_cfg.keys())}")
+
+    def _schedule_next(self, channel: str, cfg: dict) -> None:
+        """Pick and store the next timestamp when a spontaneous message should fire."""
+        interval = random.uniform(cfg["min_interval"], cfg["max_interval"])
+        self._spontaneous_next[channel] = time.time() + interval
+        self.logger.debug(
+            f"Next spontaneous message for {channel} in {interval:.0f}s"
+        )
+
+    def _spontaneous_loop(self) -> None:
+        """Background thread: periodically send a spontaneous message on configured channels."""
+        while True:
+            time.sleep(30)  # check granularity
+            if not self._connected:
+                continue
+            now = time.time()
+            for channel, cfg in list(self._spontaneous_cfg.items()):
+                if not cfg.get("enabled"):
+                    continue
+                if now < self._spontaneous_next.get(channel, 0):
+                    continue
+                history = self._channel_history.get(channel)
+                if history is None or len(history) < cfg["min_messages"]:
+                    # Not enough context yet – reschedule
+                    self._schedule_next(channel, cfg)
+                    continue
+                lines = history.get_context_lines(now)
+                self._send_spontaneous(channel, cfg, lines)
+                self._schedule_next(channel, cfg)
+
+    def _send_spontaneous(self, channel: str, cfg: dict, history_lines: list[str]) -> None:
+        """Ask the model for a spontaneous message and send it to the channel."""
+        history_text = "\n".join(history_lines[-60:])  # last 60 lines max
+        user_msg = (
+            f"{cfg['prompt']}\n\nHistoria rozmowy:\n{history_text}"
+        )
+        try:
+            self.logger.info(f"Sending spontaneous message to {channel}")
+            response = self.chatgpt_bot.respond("__spontaneous__", user_msg)
+            response = response.replace("\n", " ").strip()
+            if response:
+                irc_chunks = self.split_into_irc_chunks(response, 400)
+                for i, chunk in enumerate(irc_chunks):
+                    self.send(f"PRIVMSG {channel} :{chunk}")
+                    if i < len(irc_chunks) - 1:
+                        time.sleep(0.5)
+        except Exception as e:
+            self.logger.error(f"Error sending spontaneous message to {channel}: {e}")
 
     def update_config(self, new_config):
         """Update bot configuration dynamically."""
@@ -292,6 +420,7 @@ class IRCBot:
                 new_config.get("model", self.chatgpt_bot.model),
                 new_config.get("chat_params", self.chat_params),
             )
+        self._reload_spontaneous_config(new_config)
 
     def _next_server(self):
         """Rotate to the next server in the list (round-robin)."""
@@ -477,6 +606,10 @@ class IRCBot:
             channel = user
             self.logger.debug(f"Direct message from {user}, replying privately")
 
+        # Record message in channel history (before handling bot commands)
+        if channel in self._channel_history:
+            self._channel_history[channel].add(user, msg_content)
+
         if msg_content.startswith(self.nickname):
             max_length = 500
             prompt = msg_content.split(self.nickname, 1)[1].strip().lstrip(":")
@@ -507,6 +640,9 @@ class IRCBot:
 
     def run(self):
         """Connect and keep reconnecting on disconnect."""
+        # Start spontaneous message background thread
+        t = threading.Thread(target=self._spontaneous_loop, daemon=True, name="spontaneous")
+        t.start()
         while True:
             self.connect()
             try:

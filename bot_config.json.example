@@ -7,6 +7,16 @@
   "channels": ["#mychannel"],
   "usessl": true,
   "password": null,
-  "openai_api_key": "<openai_api_key",
-  "chat_params": { "temperature": 0.9, "max_tokens": 4096, "top_p": 1, "frequency_penalty": 1, "presence_penalty": 2, "request_timeout": 11 }
+  "openai_api_key": "<openai_api_key>",
+  "chat_params": { "temperature": 0.9, "max_tokens": 4096, "top_p": 1, "frequency_penalty": 1, "presence_penalty": 2, "request_timeout": 11 },
+  "spontaneous": {
+    "#mychannel": {
+      "enabled": true,
+      "history_window": 7200,
+      "min_interval": 1800,
+      "max_interval": 3600,
+      "min_messages": 5,
+      "prompt": "Jesteś uczestnikiem rozmowy na IRC. Na podstawie poniższej historii wiadomości napisz jedną krótką, spontaniczną wiadomość pasującą do kontekstu. Odpowiedz TYLKO treścią wiadomości, bez żadnych dodatkowych komentarzy."
+    }
+  }
 }
