@@ -132,8 +132,6 @@ class ChatGPTBot:
             temperature=self.chat_params["temperature"],
             max_completion_tokens=self.chat_params["max_tokens"],
             top_p=self.chat_params["top_p"],
-            frequency_penalty=self.chat_params["frequency_penalty"],
-            presence_penalty=self.chat_params["presence_penalty"],
         )
 
         reply = response.choices[0].message.content
@@ -430,8 +428,6 @@ class IRCBot:
                 temperature=cp["temperature"],
                 max_completion_tokens=cp["max_tokens"],
                 top_p=cp["top_p"],
-                frequency_penalty=cp["frequency_penalty"],
-                presence_penalty=cp["presence_penalty"],
             )
             response = api_response.choices[0].message.content.replace("\n", " ").strip()
             if response:
