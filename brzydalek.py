@@ -102,7 +102,7 @@ class ChannelHistory:
             now = time.time()
         with self._lock:
             self._prune(now)
-            return [f"<{m['nick']}> {m['text']}" for m in self._messages]
+            return [f"{m['nick']}: {m['text']}" for m in self._messages]
 
     def __len__(self) -> int:
         with self._lock:
@@ -114,27 +114,29 @@ class ChatGPTBot:
     def __init__(self, api_key, admin_prompt, model, chat_params):
         self.chat_params = chat_params
         self.model = model
-        openai.api_key = api_key  # Set the OpenAI API key globally
+        self._client = openai.OpenAI(
+            api_key=api_key,
+            timeout=chat_params.get("request_timeout", 30),
+        )
         self.admin_prompt = {"role": "system", "content": admin_prompt}  # Administrative prompt
         self.user_context = defaultdict(list)
+
     def respond(self, user, message):
         # Ensure the administrative prompt is included at the start of every interaction
         context = [self.admin_prompt] + self.user_context[user]
         context.append({"role": "user", "content": message})
 
-        response = openai.ChatCompletion.create(
+        response = self._client.chat.completions.create(
             model=self.model,
             messages=context,
-            temperature =  self.chat_params["temperature"],
-            max_completion_tokens = self.chat_params["max_tokens"],
-            #max_tokens = self.chat_params["max_tokens"],
-            top_p = self.chat_params["top_p"],
-            frequency_penalty = self.chat_params["frequency_penalty"],
-            presence_penalty = self.chat_params["presence_penalty"],
-            request_timeout = self.chat_params["request_timeout"]
+            temperature=self.chat_params["temperature"],
+            max_completion_tokens=self.chat_params["max_tokens"],
+            top_p=self.chat_params["top_p"],
+            frequency_penalty=self.chat_params["frequency_penalty"],
+            presence_penalty=self.chat_params["presence_penalty"],
         )
 
-        reply = response.choices[0].message["content"]
+        reply = response.choices[0].message.content
         self.user_context[user].append({"role": "user", "content": message})
         self.user_context[user].append({"role": "assistant", "content": reply})
 
@@ -422,7 +424,7 @@ class IRCBot:
             self.logger.info(f"Sending spontaneous message to {channel} "
                              f"(context: {len(recent_lines)} lines)")
             cp = self.chatgpt_bot.chat_params
-            api_response = openai.ChatCompletion.create(
+            api_response = self.chatgpt_bot._client.chat.completions.create(
                 model=self.chatgpt_bot.model,
                 messages=messages,
                 temperature=cp["temperature"],
@@ -430,9 +432,8 @@ class IRCBot:
                 top_p=cp["top_p"],
                 frequency_penalty=cp["frequency_penalty"],
                 presence_penalty=cp["presence_penalty"],
-                request_timeout=cp["request_timeout"],
             )
-            response = api_response.choices[0].message["content"].replace("\n", " ").strip()
+            response = api_response.choices[0].message.content.replace("\n", " ").strip()
             if response:
                 irc_chunks = self.split_into_irc_chunks(response, 400)
                 for i, chunk in enumerate(irc_chunks):
