@@ -144,6 +144,25 @@ class ChatGPTBot:
 
         return reply
 
+    def validate_api(self) -> None:
+        """
+        Send a minimal test request to the OpenAI API to verify that the
+        configured model and parameters are accepted.  Raises an exception
+        (openai.APIError or similar) on failure so the caller can abort
+        before connecting to IRC.
+        """
+        logger.info(
+            f"Validating OpenAI API connection (model={self.model!r})..."
+        )
+        self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": "ping"}],
+            temperature=self.chat_params["temperature"],
+            max_completion_tokens=1,
+            top_p=self.chat_params["top_p"],
+        )
+        logger.info("OpenAI API validation successful.")
+
 
 
 # ---------------------------------------------------------------------------
@@ -685,4 +704,9 @@ class IRCBot:
 
 if __name__ == "__main__":
     bot = IRCBot(config)
+    try:
+        bot.chatgpt_bot.validate_api()
+    except Exception as e:
+        logger.error(f"OpenAI API validation failed: {e}")
+        raise SystemExit(1)
     bot.run()
