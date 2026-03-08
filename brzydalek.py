@@ -476,6 +476,8 @@ class IRCBot:
                 f"Config reload aborted — OpenAI API validation failed: {e}"
             )
             return
+        # Preserve per-user conversation history across config reloads
+        new_bot.user_context = self.chatgpt_bot.user_context
         self.chatgpt_bot = new_bot
         self.config = new_config
         self._reload_spontaneous_config(new_config)
@@ -587,65 +589,66 @@ class IRCBot:
 
     def split_into_irc_chunks(self, text, max_length):
         """
-        Split text into chunks that fit within max_length, balanced so that
-        all lines are as equal in length as possible (no line much shorter
-        than the others unless it's the last one).
+        Split text into chunks that fit within max_length.
+
+        Break priority (highest to lowest):
+          1. After a sentence-ending punctuation (. ! ?) followed by whitespace
+             or end of string.
+          2. After a clause-ending punctuation (, ; :) followed by whitespace.
+          3. Between words (fallback — no mid-word splits).
+
+        The algorithm is greedy: it always extends the current chunk as far as
+        possible while still respecting the priority order above.
         """
         if len(text) <= max_length:
             return [text]
-
-        words = text.split()
-        if not words:
+        if not text.strip():
             return []
 
-        # Determine minimum number of lines needed
-        import math
-        n_lines = math.ceil(len(text) / max_length)
-
-        # Binary search for the smallest target line length that allows
-        # fitting the whole text in n_lines lines without exceeding max_length
-        lo, hi = math.ceil(len(text) / n_lines), max_length
-
-        def fits(target):
-            count, current = 1, 0
-            for word in words:
-                if current == 0:
-                    current = len(word)
-                elif current + 1 + len(word) <= target:
-                    current += 1 + len(word)
-                else:
-                    count += 1
-                    current = len(word)
-                if count > n_lines:
-                    return False
-            return True
-
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if fits(mid):
-                hi = mid
-            else:
-                lo = mid + 1
-
-        target = lo
-
-        # Build chunks using the found target length
         chunks = []
-        current_words = []
-        current_len = 0
-        for word in words:
-            if not current_words:
-                current_words = [word]
-                current_len = len(word)
-            elif current_len + 1 + len(word) <= target:
-                current_words.append(word)
-                current_len += 1 + len(word)
-            else:
-                chunks.append(" ".join(current_words))
-                current_words = [word]
-                current_len = len(word)
-        if current_words:
-            chunks.append(" ".join(current_words))
+        remaining = text.strip()
+
+        while len(remaining) > max_length:
+            candidate = remaining[:max_length]
+
+            # 1. Try to split after the last sentence boundary (. ! ?) within
+            #    the candidate.  We look for the rightmost occurrence where the
+            #    punctuation is followed by a space or is at the very end of
+            #    the candidate.
+            cut = -1
+            for i in range(len(candidate) - 1, -1, -1):
+                ch = candidate[i]
+                if ch in ".!?":
+                    # Accept if it's the last char of candidate or followed by space
+                    if i == len(candidate) - 1 or candidate[i + 1] == " ":
+                        cut = i + 1
+                        break
+
+            # 2. If no sentence boundary found, try clause punctuation (, ; :)
+            if cut == -1:
+                for i in range(len(candidate) - 1, -1, -1):
+                    ch = candidate[i]
+                    if ch in ",;:":
+                        if i == len(candidate) - 1 or candidate[i + 1] == " ":
+                            cut = i + 1
+                            break
+
+            # 3. Fall back to the last word boundary (space)
+            if cut == -1:
+                space = candidate.rfind(" ")
+                if space != -1:
+                    cut = space  # do not include the space itself
+                else:
+                    # No space at all — hard cut (single very long token)
+                    cut = max_length
+
+            chunk = remaining[:cut].rstrip()
+            if chunk:
+                chunks.append(chunk)
+            remaining = remaining[cut:].lstrip()
+
+        if remaining:
+            chunks.append(remaining)
 
         return chunks
 
@@ -716,9 +719,9 @@ class IRCBot:
 
 if __name__ == "__main__":
     bot = IRCBot(config)
-    try:
-        bot.chatgpt_bot.validate_api()
-    except Exception as e:
-        logger.error(f"OpenAI API validation failed: {e}")
-        raise SystemExit(1)
+    # try:
+    #     bot.chatgpt_bot.validate_api()
+    # except Exception as e:
+    #     logger.error(f"OpenAI API validation failed: {e}")
+    #     raise SystemExit(1)
     bot.run()
