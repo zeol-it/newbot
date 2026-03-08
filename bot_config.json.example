@@ -16,7 +16,7 @@
       "min_interval": 1800,
       "max_interval": 3600,
       "min_messages": 5,
-      "prompt": "Jesteś uczestnikiem rozmowy na IRC. Na podstawie poniższej historii wiadomości napisz jedną krótką, spontaniczną wiadomość pasującą do kontekstu. Odpowiedz TYLKO treścią wiadomości, bez żadnych dodatkowych komentarzy."
+      "prompt": "Dołącz spontanicznie do tej rozmowy — napisz jedną krótką wiadomość nawiązującą do tego, o czym właśnie rozmawiają. Odpowiedz TYLKO treścią wiadomości, bez żadnych dodatkowych komentarzy."
     }
   }
 }

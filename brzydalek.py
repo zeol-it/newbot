@@ -341,10 +341,9 @@ class IRCBot:
                 "min_messages": int(opts.get("min_messages", 5)),
                 "prompt": opts.get(
                     "prompt",
-                    "Jesteś uczestnikiem rozmowy na IRC. Na podstawie poniższej historii "
-                    "wiadomości napisz jedną krótką, spontaniczną wiadomość pasującą do "
-                    "kontekstu. Odpowiedz TYLKO treścią wiadomości, bez żadnych "
-                    "dodatkowych komentarzy.",
+                    "Dołącz spontanicznie do tej rozmowy — napisz jedną krótką wiadomość "
+                    "nawiązującą do tego, o czym właśnie rozmawiają. "
+                    "Odpowiedz TYLKO treścią wiadomości, bez żadnych dodatkowych komentarzy.",
                 ),
             }
             # Create or resize ChannelHistory
@@ -388,16 +387,52 @@ class IRCBot:
                 self._send_spontaneous(channel, cfg, lines)
                 self._schedule_next(channel, cfg)
 
-    def _send_spontaneous(self, channel: str, cfg: dict, history_lines: list[str]) -> None:
-        """Ask the model for a spontaneous message and send it to the channel."""
-        history_text = "\n".join(history_lines[-60:])  # last 60 lines max
-        user_msg = (
-            f"{cfg['prompt']}\n\nHistoria rozmowy:\n{history_text}"
-        )
+    def _send_spontaneous(self, channel: str, cfg: dict, history_lines: list) -> None:
+        """Ask the model for a spontaneous message and send it to the channel.
+
+        The channel history is passed as individual chat messages so the model
+        sees a real conversation rather than a flat block of text.  Each IRC
+        line '<nick> text' is mapped to a 'user' role message.  Lines sent by
+        the bot itself are mapped to 'assistant' so the model knows its own
+        prior contributions.
+        """
+        recent_lines = history_lines[-60:]  # at most 60 most-recent lines
+
+        # Build messages list: system prompt + channel history as chat turns
+        messages = [
+            {"role": "system", "content": self.chatgpt_bot.admin_prompt["content"]},
+        ]
+        for line in recent_lines:
+            # line format: "<nick> text"
+            if line.startswith(f"<{self.nickname}>"):
+                role = "assistant"
+                text = line[len(f"<{self.nickname}> "):]
+            else:
+                role = "user"
+                text = line
+            messages.append({"role": role, "content": text})
+
+        # Final instruction — ask the model to chime in spontaneously
+        messages.append({
+            "role": "user",
+            "content": cfg["prompt"],
+        })
+
         try:
-            self.logger.info(f"Sending spontaneous message to {channel}")
-            response = self.chatgpt_bot.respond("__spontaneous__", user_msg)
-            response = response.replace("\n", " ").strip()
+            self.logger.info(f"Sending spontaneous message to {channel} "
+                             f"(context: {len(recent_lines)} lines)")
+            cp = self.chatgpt_bot.chat_params
+            api_response = openai.ChatCompletion.create(
+                model=self.chatgpt_bot.model,
+                messages=messages,
+                temperature=cp["temperature"],
+                max_completion_tokens=cp["max_tokens"],
+                top_p=cp["top_p"],
+                frequency_penalty=cp["frequency_penalty"],
+                presence_penalty=cp["presence_penalty"],
+                request_timeout=cp["request_timeout"],
+            )
+            response = api_response.choices[0].message["content"].replace("\n", " ").strip()
             if response:
                 irc_chunks = self.split_into_irc_chunks(response, 400)
                 for i, chunk in enumerate(irc_chunks):
