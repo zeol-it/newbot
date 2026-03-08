@@ -337,6 +337,7 @@ class IRCBot:
                 self.send(f"USER {self.nickname} 0 * :{self.nickname}")
 
                 for channel in self.channels:
+                    self.logger.debug(f"Joining channel: {channel}")
                     self.send(f"JOIN {channel}")
 
                 self.logger.info(f"Connected to {host}:{port}")
@@ -352,6 +353,7 @@ class IRCBot:
                 delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
 
     def send(self, message):
+        self.logger.debug(f"> {message}")
         self.irc.send((message + "\r\n").encode("utf-8"))
 
     def listen(self):
@@ -365,7 +367,7 @@ class IRCBot:
                 for line in lines:
                     if line.startswith("PING"):
                         server = line.split()[1]
-                        self.logger.debug(f"PONG {server}")
+                        self.logger.debug(f"PING received from {server}, sending PONG")
                         self.send(f"PONG {server}")
                     else:
                         self.logger.debug(f"< {line}")
@@ -374,6 +376,7 @@ class IRCBot:
                         inviter = parts[0][1:].split("!")[0]  # Extract inviter's nickname
                         channel = parts[3][1:]  # Extract channel name
                         self.logger.info(f"Invited by {inviter} to join {channel}")
+                        self.logger.debug(f"Joining channel {channel} on invitation from {inviter}")
                         self.send(f"JOIN {channel}")
                     self.handle_message(line)
 
@@ -468,35 +471,35 @@ class IRCBot:
         channel = parts[2]
         msg_content = parts[3][1:]
 
-        self.logger.debug(f"Received message from {user} in {channel}: {msg_content}")
+        self.logger.debug(f"PRIVMSG from {user} in {channel}: {msg_content}")
 
         if channel == self.nickname:
             channel = user
-            self.logger.debug(f"Direct message, setting channel to {channel}")
+            self.logger.debug(f"Direct message from {user}, replying privately")
 
         if msg_content.startswith(self.nickname):
             max_length = 500
             prompt = msg_content.split(self.nickname, 1)[1].strip().lstrip(":")
-            self.logger.debug(f"Extracted prompt: {prompt}")
+            self.logger.debug(f"Bot addressed by {user} in {channel}, prompt: {prompt!r}")
             prompt = self.sanitize_prompt(user, prompt)
 
             chunks = [prompt[i:i + max_length] for i in range(0, len(prompt), max_length)]
-            self.logger.debug(f"Split into {len(chunks)} chunks: {chunks}")
+            if len(chunks) > 1:
+                self.logger.debug(f"Prompt split into {len(chunks)} chunks for ChatGPT")
 
+            self.logger.debug(f"Querying ChatGPT for {user}...")
             responses = [self.chatgpt_bot.respond(user, chunk) for chunk in chunks]
             response = ' '.join(responses).replace('\n', ' ').strip()
-            self.logger.debug(f"Combined response (no newlines): {response}")
+            self.logger.debug(f"ChatGPT response for {user}: {response!r}")
 
             # Split response into balanced IRC-sized chunks
             irc_chunks = self.split_into_irc_chunks(response, 400)
-
-            self.logger.debug(f"Split into {len(irc_chunks)} IRC chunks")
+            self.logger.debug(f"Sending {len(irc_chunks)} IRC message(s) to {channel}")
 
             for i, chunk in enumerate(irc_chunks):
                 try:
                     message = f"PRIVMSG {channel} :{user}: {chunk}" if i == 0 else f"PRIVMSG {channel} :{chunk}"
                     self.send(message)
-                    self.logger.debug(f"Sent chunk {i+1}/{len(irc_chunks)}: {message}")
                     time.sleep(0.5)
                 except Exception as e:
                     self.logger.error(f"Error sending message chunk {i+1}: {e}")
