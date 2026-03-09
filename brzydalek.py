@@ -102,7 +102,7 @@ class ChannelHistory:
             now = time.time()
         with self._lock:
             self._prune(now)
-            return [f"<{m['nick']}> {m['text']}" for m in self._messages]
+            return [f"{m['nick']}: {m['text']}" for m in self._messages]
 
     def __len__(self) -> int:
         with self._lock:
@@ -114,27 +114,27 @@ class ChatGPTBot:
     def __init__(self, api_key, admin_prompt, model, chat_params):
         self.chat_params = chat_params
         self.model = model
-        openai.api_key = api_key  # Set the OpenAI API key globally
+        self._client = openai.OpenAI(
+            api_key=api_key,
+            timeout=chat_params.get("request_timeout", 30),
+        )
         self.admin_prompt = {"role": "system", "content": admin_prompt}  # Administrative prompt
         self.user_context = defaultdict(list)
+
     def respond(self, user, message):
         # Ensure the administrative prompt is included at the start of every interaction
         context = [self.admin_prompt] + self.user_context[user]
         context.append({"role": "user", "content": message})
 
-        response = openai.ChatCompletion.create(
+        response = self._client.chat.completions.create(
             model=self.model,
             messages=context,
-            temperature =  self.chat_params["temperature"],
-            max_completion_tokens = self.chat_params["max_tokens"],
-            #max_tokens = self.chat_params["max_tokens"],
-            top_p = self.chat_params["top_p"],
-            frequency_penalty = self.chat_params["frequency_penalty"],
-            presence_penalty = self.chat_params["presence_penalty"],
-            request_timeout = self.chat_params["request_timeout"]
+            temperature=self.chat_params["temperature"],
+            max_completion_tokens=self.chat_params["max_tokens"],
+            top_p=self.chat_params["top_p"],
         )
 
-        reply = response.choices[0].message["content"]
+        reply = response.choices[0].message.content
         self.user_context[user].append({"role": "user", "content": message})
         self.user_context[user].append({"role": "assistant", "content": reply})
 
@@ -143,6 +143,25 @@ class ChatGPTBot:
             self.user_context[user] = self.user_context[user][-19:]  # Retain only the latest messages
 
         return reply
+
+    def validate_api(self) -> None:
+        """
+        Send a minimal test request to the OpenAI API to verify that the
+        configured model and parameters are accepted.  Raises an exception
+        (openai.APIError or similar) on failure so the caller can abort
+        before connecting to IRC.
+        """
+        logger.info(
+            f"Validating OpenAI API connection (model={self.model!r})..."
+        )
+        self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": "ping"}],
+            temperature=self.chat_params["temperature"],
+            max_completion_tokens=1,
+            top_p=self.chat_params["top_p"],
+        )
+        logger.info("OpenAI API validation successful.")
 
 
 
@@ -338,7 +357,7 @@ class IRCBot:
                 "history_window": int(opts.get("history_window", 7200)),
                 "min_interval": int(opts.get("min_interval", 1800)),
                 "max_interval": int(opts.get("max_interval", 3600)),
-                "min_messages": int(opts.get("min_messages", 5)),
+                "min_messages": int(opts.get("min_messages", 50)),
                 "prompt": opts.get(
                     "prompt",
                     "Dołącz spontanicznie do tej rozmowy — napisz jedną krótką wiadomość "
@@ -422,17 +441,14 @@ class IRCBot:
             self.logger.info(f"Sending spontaneous message to {channel} "
                              f"(context: {len(recent_lines)} lines)")
             cp = self.chatgpt_bot.chat_params
-            api_response = openai.ChatCompletion.create(
+            api_response = self.chatgpt_bot._client.chat.completions.create(
                 model=self.chatgpt_bot.model,
                 messages=messages,
                 temperature=cp["temperature"],
                 max_completion_tokens=cp["max_tokens"],
                 top_p=cp["top_p"],
-                frequency_penalty=cp["frequency_penalty"],
-                presence_penalty=cp["presence_penalty"],
-                request_timeout=cp["request_timeout"],
             )
-            response = api_response.choices[0].message["content"].replace("\n", " ").strip()
+            response = api_response.choices[0].message.content.replace("\n", " ").strip()
             if response:
                 irc_chunks = self.split_into_irc_chunks(response, 400)
                 for i, chunk in enumerate(irc_chunks):
@@ -445,16 +461,25 @@ class IRCBot:
     def update_config(self, new_config):
         """Update bot configuration dynamically."""
         self.logger.info("Updating configuration...")
-        self.config = new_config
 
-        # Reinitialize ChatGPT bot if the API key or model changes
-        if "openai_api_key" in new_config or "model" in new_config:
-            self.chatgpt_bot = ChatGPTBot(
-                new_config.get("openai_api_key", self.chatgpt_bot.model),
-                self.admin_prompt,
-                new_config.get("model", self.chatgpt_bot.model),
-                new_config.get("chat_params", self.chat_params),
+        # Reinitialize ChatGPT bot if the API key, model or chat_params change
+        new_bot = ChatGPTBot(
+            new_config.get("openai_api_key", self.chatgpt_bot._client.api_key),
+            new_config.get("admin_prompt", self.admin_prompt),
+            new_config.get("model", self.chatgpt_bot.model),
+            new_config.get("chat_params", self.chatgpt_bot.chat_params),
+        )
+        try:
+            new_bot.validate_api()
+        except Exception as e:
+            self.logger.error(
+                f"Config reload aborted — OpenAI API validation failed: {e}"
             )
+            return
+        # Preserve per-user conversation history across config reloads
+        new_bot.user_context = self.chatgpt_bot.user_context
+        self.chatgpt_bot = new_bot
+        self.config = new_config
         self._reload_spontaneous_config(new_config)
 
     def _next_server(self):
@@ -564,65 +589,66 @@ class IRCBot:
 
     def split_into_irc_chunks(self, text, max_length):
         """
-        Split text into chunks that fit within max_length, balanced so that
-        all lines are as equal in length as possible (no line much shorter
-        than the others unless it's the last one).
+        Split text into chunks that fit within max_length.
+
+        Break priority (highest to lowest):
+          1. After a sentence-ending punctuation (. ! ?) followed by whitespace
+             or end of string.
+          2. After a clause-ending punctuation (, ; :) followed by whitespace.
+          3. Between words (fallback — no mid-word splits).
+
+        The algorithm is greedy: it always extends the current chunk as far as
+        possible while still respecting the priority order above.
         """
         if len(text) <= max_length:
             return [text]
-
-        words = text.split()
-        if not words:
+        if not text.strip():
             return []
 
-        # Determine minimum number of lines needed
-        import math
-        n_lines = math.ceil(len(text) / max_length)
-
-        # Binary search for the smallest target line length that allows
-        # fitting the whole text in n_lines lines without exceeding max_length
-        lo, hi = math.ceil(len(text) / n_lines), max_length
-
-        def fits(target):
-            count, current = 1, 0
-            for word in words:
-                if current == 0:
-                    current = len(word)
-                elif current + 1 + len(word) <= target:
-                    current += 1 + len(word)
-                else:
-                    count += 1
-                    current = len(word)
-                if count > n_lines:
-                    return False
-            return True
-
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if fits(mid):
-                hi = mid
-            else:
-                lo = mid + 1
-
-        target = lo
-
-        # Build chunks using the found target length
         chunks = []
-        current_words = []
-        current_len = 0
-        for word in words:
-            if not current_words:
-                current_words = [word]
-                current_len = len(word)
-            elif current_len + 1 + len(word) <= target:
-                current_words.append(word)
-                current_len += 1 + len(word)
-            else:
-                chunks.append(" ".join(current_words))
-                current_words = [word]
-                current_len = len(word)
-        if current_words:
-            chunks.append(" ".join(current_words))
+        remaining = text.strip()
+
+        while len(remaining) > max_length:
+            candidate = remaining[:max_length]
+
+            # 1. Try to split after the last sentence boundary (. ! ?) within
+            #    the candidate.  We look for the rightmost occurrence where the
+            #    punctuation is followed by a space or is at the very end of
+            #    the candidate.
+            cut = -1
+            for i in range(len(candidate) - 1, -1, -1):
+                ch = candidate[i]
+                if ch in ".!?":
+                    # Accept if it's the last char of candidate or followed by space
+                    if i == len(candidate) - 1 or candidate[i + 1] == " ":
+                        cut = i + 1
+                        break
+
+            # 2. If no sentence boundary found, try clause punctuation (, ; :)
+            if cut == -1:
+                for i in range(len(candidate) - 1, -1, -1):
+                    ch = candidate[i]
+                    if ch in ",;:":
+                        if i == len(candidate) - 1 or candidate[i + 1] == " ":
+                            cut = i + 1
+                            break
+
+            # 3. Fall back to the last word boundary (space)
+            if cut == -1:
+                space = candidate.rfind(" ")
+                if space != -1:
+                    cut = space  # do not include the space itself
+                else:
+                    # No space at all — hard cut (single very long token)
+                    cut = max_length
+
+            chunk = remaining[:cut].rstrip()
+            if chunk:
+                chunks.append(chunk)
+            remaining = remaining[cut:].lstrip()
+
+        if remaining:
+            chunks.append(remaining)
 
         return chunks
 
@@ -656,7 +682,12 @@ class IRCBot:
                 self.logger.debug(f"Prompt split into {len(chunks)} chunks for ChatGPT")
 
             self.logger.debug(f"Querying ChatGPT for {user}...")
-            responses = [self.chatgpt_bot.respond(user, chunk) for chunk in chunks]
+            try:
+                responses = [self.chatgpt_bot.respond(user, chunk) for chunk in chunks]
+            except Exception as e:
+                self.logger.error(f"OpenAI API error for {user}: {e}")
+                self.send(f"PRIVMSG {channel} :{user}: [błąd API: {e}]")
+                return
             response = ' '.join(responses).replace('\n', ' ').strip()
             self.logger.debug(f"ChatGPT response for {user}: {response!r}")
 
@@ -688,4 +719,9 @@ class IRCBot:
 
 if __name__ == "__main__":
     bot = IRCBot(config)
+    # try:
+    #     bot.chatgpt_bot.validate_api()
+    # except Exception as e:
+    #     logger.error(f"OpenAI API validation failed: {e}")
+    #     raise SystemExit(1)
     bot.run()
