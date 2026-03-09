@@ -357,7 +357,7 @@ class IRCBot:
                 "history_window": int(opts.get("history_window", 7200)),
                 "min_interval": int(opts.get("min_interval", 1800)),
                 "max_interval": int(opts.get("max_interval", 3600)),
-                "min_messages": int(opts.get("min_messages", 5)),
+                "min_messages": int(opts.get("min_messages", 50)),
                 "prompt": opts.get(
                     "prompt",
                     "Dołącz spontanicznie do tej rozmowy — napisz jedną krótką wiadomość "
