@@ -6,6 +6,7 @@ try:
 except ImportError:
     _LANGDETECT_AVAILABLE = False
 import ssl
+import os
 import time
 import json
 import random
@@ -39,11 +40,14 @@ class ConfigReloader(FileSystemEventHandler):
         :param config_path: Path to the configuration file.
         :param callback: Function to call with the new config when the file changes.
         """
-        self.config_path = config_path
+        # store absolute path for reliable comparison with event.src_path
+        self.config_path = os.path.abspath(config_path)
         self.callback = callback
 
     def on_modified(self, event):
-        if event.src_path == self.config_path:
+        # Compare absolute paths to avoid mismatches between relative
+        # and absolute event.src_path values reported by watchdog.
+        if os.path.abspath(event.src_path) == self.config_path:
             try:
                 with open(self.config_path, "r") as f:
                     new_config = json.load(f)
@@ -60,7 +64,9 @@ def start_config_watcher(config_path, callback):
     """
     event_handler = ConfigReloader(config_path, callback)
     observer = Observer()
-    observer.schedule(event_handler, path=config_path, recursive=False)
+    # Schedule the watcher on the directory containing the config file.
+    watch_dir = os.path.dirname(os.path.abspath(config_path)) or "."
+    observer.schedule(event_handler, path=watch_dir, recursive=False)
     observer_thread = threading.Thread(target=observer.start)
     observer_thread.daemon = True
     observer_thread.start()
@@ -724,4 +730,9 @@ if __name__ == "__main__":
     # except Exception as e:
     #     logger.error(f"OpenAI API validation failed: {e}")
     #     raise SystemExit(1)
+    # Start a file watcher to reload configuration on changes.
+    try:
+        start_config_watcher(CONFIG_FILE, bot.update_config)
+    except Exception as e:
+        logger.error(f"Failed to start config watcher: {e}")
     bot.run()

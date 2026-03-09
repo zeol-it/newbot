@@ -15,7 +15,7 @@
       "history_window": 7200,
       "min_interval": 1800,
       "max_interval": 3600,
-      "min_messages": 5,
+      "min_messages": 50,
       "prompt": "Dołącz spontanicznie do tej rozmowy — napisz jedną krótką wiadomość nawiązującą do tego, o czym właśnie rozmawiają. Odpowiedz TYLKO treścią wiadomości, bez żadnych dodatkowych komentarzy."
     }
   }
