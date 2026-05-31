@@ -389,8 +389,30 @@ class ChatGPTBot:
 
     def _extract_reply_text(self, response) -> str:
         if self._uses_responses_api():
-            return (response.output_text or "").strip()
-        return (response.choices[0].message.content or "").strip()
+            text = (response.output_text or "").strip()
+            if not text:
+                logger.warning(
+                    "Responses API returned empty output_text. status=%r",
+                    getattr(response, "status", None),
+                )
+            return text
+
+        choice = response.choices[0]
+        finish_reason = choice.finish_reason
+        message = choice.message
+
+        # Newer models signal a refusal via message.refusal instead of content
+        refusal = getattr(message, "refusal", None)
+        if refusal:
+            logger.warning("Model refused the request: %r", refusal)
+            return refusal.strip()
+
+        content = (message.content or "").strip()
+        if not content:
+            logger.warning(
+                "Model returned empty content. finish_reason=%r", finish_reason
+            )
+        return content
 
     def generate_reply(self, messages: list[dict]) -> str:
         response = self._request_completion(messages)
