@@ -15,6 +15,7 @@ import random
 import logging
 import openai
 import sqlite3
+import sys
 import threading
 from difflib import SequenceMatcher
 from collections import defaultdict, deque
@@ -801,7 +802,7 @@ class IRCBot:
             )
             if context_store is not old_context_store:
                 context_store.close()
-            return
+            return False
         if reuse_context_store:
             context_store.reconfigure(
                 bot_nickname=new_config.get("nickname", self.nickname),
@@ -809,6 +810,16 @@ class IRCBot:
                 channel_history_messages=context_cfg["channel_history_messages"],
                 isolate_user_context_per_channel=context_cfg["isolate_user_context_per_channel"],
             )
+        if "servers" in new_config:
+            self.servers = new_config["servers"]
+        elif "server" in new_config and "port" in new_config:
+            self.servers = [{"host": new_config["server"], "port": new_config["port"]}]
+        self.source_ip = new_config.get("source_ip", self.source_ip)
+        self.channels = new_config.get("channels", self.channels)
+        self.usessl = new_config.get("usessl", self.usessl)
+        self.password = new_config.get("password")
+        self.chat_params = new_config.get("chat_params", self.chat_params)
+        self.admin_prompt = new_config.get("admin_prompt", self.admin_prompt)
         self.chatgpt_bot = new_bot
         self.context_store = context_store
         self.config = new_config
@@ -816,6 +827,7 @@ class IRCBot:
         self._reload_spontaneous_config(new_config)
         if context_store is not old_context_store:
             old_context_store.close()
+        return True
 
     def _next_server(self):
         """Rotate to the next server in the list (round-robin)."""
@@ -1159,11 +1171,24 @@ class IRCBot:
                 self.logger.info("Reconnecting...")
                 self._close_socket()
 
-if __name__ == "__main__":
+
+def run_cli_reload() -> int:
     bot = IRCBot(config)
-    # try:
-    #     bot.chatgpt_bot.validate_api()
-    # except Exception as e:
-    #     logger.error(f"OpenAI API validation failed: {e}")
-    #     raise SystemExit(1)
+    try:
+        new_config = load_config()
+        success = bot.update_config(new_config)
+        if success:
+            logger.info("Configuration reload completed successfully.")
+            return 0
+        return 1
+    finally:
+        bot.context_store.close()
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--reload-config" and len(sys.argv) == 2:
+            raise SystemExit(run_cli_reload())
+        raise SystemExit("Usage: python brzydalek.py [--reload-config]")
+
+    bot = IRCBot(config)
     bot.run()
