@@ -365,6 +365,9 @@ class ChatGPTBot:
             total_chars += len(message.get("content", ""))
         return max(1, total_chars // 4)
 
+    def _uses_responses_api(self) -> bool:
+        return self.model.startswith("gpt-5")
+
     def completion_token_budget(
         self,
         messages: list[dict],
@@ -402,6 +405,20 @@ class ChatGPTBot:
             min_tokens_override=min_tokens_override,
             max_tokens_override=max_tokens_override,
         )
+        if self._uses_responses_api():
+            request = {
+                "model": self.model,
+                "input": messages,
+                "max_output_tokens": completion_tokens,
+                "reasoning": {
+                    "effort": self.chat_params.get("reasoning_effort", "low"),
+                },
+            }
+            verbosity = self.chat_params.get("verbosity")
+            if verbosity:
+                request["text"] = {"verbosity": verbosity}
+            return self._client.responses.create(**request)
+
         return self._client.chat.completions.create(
             model=self.model,
             messages=messages,
@@ -410,9 +427,14 @@ class ChatGPTBot:
             top_p=self.chat_params["top_p"],
         )
 
+    def _extract_reply_text(self, response) -> str:
+        if self._uses_responses_api():
+            return (response.output_text or "").strip()
+        return (response.choices[0].message.content or "").strip()
+
     def generate_reply(self, messages: list[dict]) -> str:
         response = self._request_completion(messages)
-        reply = (response.choices[0].message.content or "").strip()
+        reply = self._extract_reply_text(response)
         if reply:
             return reply
 
@@ -434,7 +456,7 @@ class ChatGPTBot:
             min_tokens_override=retry_tokens,
             max_tokens_override=retry_tokens,
         )
-        reply = (response.choices[0].message.content or "").strip()
+        reply = self._extract_reply_text(response)
         if reply:
             return reply
         raise ValueError("Model returned an empty response.")
@@ -466,12 +488,10 @@ class ChatGPTBot:
         logger.info(
             f"Validating OpenAI API connection (model={self.model!r})..."
         )
-        self._client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": "ping"}],
-            temperature=self.chat_params["temperature"],
-            max_completion_tokens=1,
-            top_p=self.chat_params["top_p"],
+        self._request_completion(
+            [{"role": "user", "content": "ping"}],
+            min_tokens_override=16,
+            max_tokens_override=32,
         )
         logger.info("OpenAI API validation successful.")
 

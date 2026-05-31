@@ -20,6 +20,8 @@
     "max_response_tokens": 320,
     "response_tokens_ratio": 0.35,
     "empty_response_retry_tokens": 480,
+    "reasoning_effort": "low",
+    "verbosity": "low",
     "top_p": 1,
     "frequency_penalty": 1,
     "presence_penalty": 2,
