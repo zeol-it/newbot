@@ -18,11 +18,9 @@ import sqlite3
 import threading
 from difflib import SequenceMatcher
 from collections import defaultdict, deque
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -36,45 +34,6 @@ def load_config():
         return json.load(f)
 
 config = load_config()
-
-class ConfigReloader(FileSystemEventHandler):
-    def __init__(self, config_path, callback):
-        """
-        Monitors a file for changes and reloads it dynamically.
-        :param config_path: Path to the configuration file.
-        :param callback: Function to call with the new config when the file changes.
-        """
-        # store absolute path for reliable comparison with event.src_path
-        self.config_path = os.path.abspath(config_path)
-        self.callback = callback
-
-    def on_modified(self, event):
-        # Compare absolute paths to avoid mismatches between relative
-        # and absolute event.src_path values reported by watchdog.
-        if os.path.abspath(event.src_path) == self.config_path:
-            try:
-                with open(self.config_path, "r") as f:
-                    new_config = json.load(f)
-                self.callback(new_config)
-                logger.info(f"Configuration reloaded from: {self.config_path}")
-            except Exception as e:
-                logger.error(f"Error reloading configuration: {e}")
-
-def start_config_watcher(config_path, callback):
-    """
-    Start a separate thread to monitor configuration file changes.
-    :param config_path: Path to the configuration file.
-    :param callback: Function to call with the new config when the file changes.
-    """
-    event_handler = ConfigReloader(config_path, callback)
-    observer = Observer()
-    # Schedule the watcher on the directory containing the config file.
-    watch_dir = os.path.dirname(os.path.abspath(config_path)) or "."
-    observer.schedule(event_handler, path=watch_dir, recursive=False)
-    observer_thread = threading.Thread(target=observer.start)
-    observer_thread.daemon = True
-    observer_thread.start()
-    return observer
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +626,6 @@ class IRCBot:
                 "history_window": int(opts.get("history_window", 7200)),
                 "min_interval": int(opts.get("min_interval", 1800)),
                 "max_interval": int(opts.get("max_interval", 3600)),
-                "min_messages": int(opts.get("min_messages", 50)),
                 "recent_messages": int(opts.get("recent_messages", 40)),
                 "similarity_threshold": float(opts.get("similarity_threshold", 0.9)),
                 "similarity_lookback": int(opts.get("similarity_lookback", 12)),
@@ -712,8 +670,13 @@ class IRCBot:
                     limit=cfg["recent_messages"],
                     since_seconds=cfg["history_window"],
                 )
-                if len(lines) < cfg["min_messages"]:
-                    # Not enough context yet – reschedule
+                if len(lines) < cfg["recent_messages"]:
+                    self.logger.info(
+                        "[SPONTANEOUS] Skipping autonomous message for %s: only %d/%d messages in the current history window",
+                        channel,
+                        len(lines),
+                        cfg["recent_messages"],
+                    )
                     self._schedule_next(channel, cfg)
                     continue
                 self._send_spontaneous(channel, cfg, lines)
@@ -765,8 +728,11 @@ class IRCBot:
         })
 
         try:
-            self.logger.info(f"Sending spontaneous message to {channel} "
-                             f"(context: {len(recent_messages)} lines)")
+            self.logger.info(
+                "[SPONTANEOUS] Generating autonomous message for %s (context: %d lines)",
+                channel,
+                len(recent_messages),
+            )
             cp = self.chatgpt_bot.chat_params
             api_response = self.chatgpt_bot._client.chat.completions.create(
                 model=self.chatgpt_bot.model,
@@ -779,10 +745,15 @@ class IRCBot:
             if response:
                 if self._is_similar_spontaneous(channel, response, cfg):
                     self.logger.info(
-                        "Skipping spontaneous message for %s because it is too similar to a prior one",
+                        "[SPONTANEOUS] Skipping autonomous message for %s because it is too similar to a prior one",
                         channel,
                     )
                     return
+                self.logger.info(
+                    "[SPONTANEOUS] Bot is sending autonomous message to %s: %s",
+                    channel,
+                    response,
+                )
                 irc_chunks = self.split_into_irc_chunks(response, 400)
                 for i, chunk in enumerate(irc_chunks):
                     self.send(f"PRIVMSG {channel} :{chunk}")
@@ -799,7 +770,7 @@ class IRCBot:
                         time.sleep(0.5)
                 self.context_store.add_spontaneous_message(channel, response)
         except Exception as e:
-            self.logger.error(f"Error sending spontaneous message to {channel}: {e}")
+            self.logger.error(f"[SPONTANEOUS] Error sending autonomous message to {channel}: {e}")
 
     def update_config(self, new_config):
         """Update bot configuration dynamically."""
@@ -1187,9 +1158,4 @@ if __name__ == "__main__":
     # except Exception as e:
     #     logger.error(f"OpenAI API validation failed: {e}")
     #     raise SystemExit(1)
-    # Start a file watcher to reload configuration on changes.
-    try:
-        start_config_watcher(CONFIG_FILE, bot.update_config)
-    except Exception as e:
-        logger.error(f"Failed to start config watcher: {e}")
     bot.run()
