@@ -1068,7 +1068,6 @@ class IRCBot:
 
         if channel == self.nickname:
             channel = user
-            self.logger.debug(f"Direct message from {user}, replying privately")
             is_private = True
         else:
             is_private = False
@@ -1080,7 +1079,12 @@ class IRCBot:
 
         max_length = 500
         prompt = msg_content if is_private else msg_content.split(self.nickname, 1)[1].strip().lstrip(":")
-        self.logger.debug(f"Bot addressed by {user} in {channel}, prompt: {prompt!r}")
+        self.logger.info(
+            "user=%s channel=%s message=%r",
+            user,
+            channel,
+            prompt,
+        )
         sanitized_prompt = self.sanitize_prompt(user, prompt)
 
         chunks = [
@@ -1090,7 +1094,6 @@ class IRCBot:
         if len(chunks) > 1:
             self.logger.debug(f"Prompt split into {len(chunks)} chunks for ChatGPT")
 
-        self.logger.debug(f"Querying ChatGPT for {user}...")
         try:
             responses = [
                 self.chatgpt_bot.respond(channel, user, chunk, is_private=is_private)
@@ -1104,7 +1107,12 @@ class IRCBot:
             self.send(f"PRIVMSG {channel} :{error_text}")
             return
         response = ' '.join(responses).replace('\n', ' ').strip()
-        self.logger.debug(f"ChatGPT response for {user}: {response!r}")
+        self.logger.info(
+            "user=%s channel=%s message=%r",
+            self.nickname,
+            channel,
+            response,
+        )
 
         if not is_private:
             self._store_channel_message(channel, user, msg_content)
