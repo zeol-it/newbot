@@ -14,7 +14,16 @@
     "channel_history_messages": 100,
     "isolate_user_context_per_channel": true
   },
-  "chat_params": { "temperature": 0.9, "max_tokens": 4096, "top_p": 1, "frequency_penalty": 1, "presence_penalty": 2, "request_timeout": 11 },
+  "chat_params": {
+    "temperature": 0.9,
+    "min_response_tokens": 100,
+    "max_response_tokens": 320,
+    "response_tokens_ratio": 0.35,
+    "top_p": 1,
+    "frequency_penalty": 1,
+    "presence_penalty": 2,
+    "request_timeout": 11
+  },
   "spontaneous": {
     "#mychannel": {
       "enabled": true,

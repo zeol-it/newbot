@@ -359,6 +359,26 @@ class ChatGPTBot:
         self.admin_prompt = {"role": "system", "content": admin_prompt}  # Administrative prompt
         self.context_store = context_store
 
+    def _estimate_prompt_tokens(self, messages: list[dict]) -> int:
+        total_chars = 0
+        for message in messages:
+            total_chars += len(message.get("role", ""))
+            total_chars += len(message.get("content", ""))
+        return max(1, total_chars // 4)
+
+    def completion_token_budget(self, messages: list[dict]) -> int:
+        estimated_input_tokens = self._estimate_prompt_tokens(messages)
+        min_tokens = int(self.chat_params.get("min_response_tokens", 80))
+        max_tokens = int(
+            self.chat_params.get(
+                "max_response_tokens",
+                self.chat_params.get("max_tokens", 220),
+            )
+        )
+        ratio = float(self.chat_params.get("response_tokens_ratio", 0.35))
+        computed_tokens = int(estimated_input_tokens * ratio)
+        return max(min_tokens, min(max_tokens, computed_tokens))
+
     def respond(self, channel, user, message, is_private=False):
         # Ensure the administrative prompt is included at the start of every interaction
         context = [self.admin_prompt]
@@ -374,12 +394,13 @@ class ChatGPTBot:
                 })
         context.extend(self.context_store.get_conversation_messages(channel, user, is_private))
         context.append({"role": "user", "content": message})
+        completion_tokens = self.completion_token_budget(context)
 
         response = self._client.chat.completions.create(
             model=self.model,
             messages=context,
             temperature=self.chat_params["temperature"],
-            max_completion_tokens=self.chat_params["max_tokens"],
+            max_completion_tokens=completion_tokens,
             top_p=self.chat_params["top_p"],
         )
 
@@ -735,11 +756,12 @@ class IRCBot:
                 len(recent_messages),
             )
             cp = self.chatgpt_bot.chat_params
+            completion_tokens = self.chatgpt_bot.completion_token_budget(messages)
             api_response = self.chatgpt_bot._client.chat.completions.create(
                 model=self.chatgpt_bot.model,
                 messages=messages,
                 temperature=cp["temperature"],
-                max_completion_tokens=cp["max_tokens"],
+                max_completion_tokens=completion_tokens,
                 top_p=cp["top_p"],
             )
             response = api_response.choices[0].message.content.replace("\n", " ").strip()
