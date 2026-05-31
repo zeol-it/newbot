@@ -8,6 +8,12 @@
   "usessl": true,
   "password": null,
   "openai_api_key": "<openai_api_key>",
+  "context": {
+    "database_path": "./context.sqlite3",
+    "user_history_messages": 15,
+    "channel_history_messages": 100,
+    "isolate_user_context_per_channel": true
+  },
   "chat_params": { "temperature": 0.9, "max_tokens": 4096, "top_p": 1, "frequency_penalty": 1, "presence_penalty": 2, "request_timeout": 11 },
   "spontaneous": {
     "#mychannel": {
@@ -16,7 +22,10 @@
       "min_interval": 1800,
       "max_interval": 3600,
       "min_messages": 50,
-      "prompt": "Dołącz spontanicznie do tej rozmowy — napisz jedną krótką wiadomość nawiązującą do tego, o czym właśnie rozmawiają. Odpowiedz TYLKO treścią wiadomości, bez żadnych dodatkowych komentarzy."
+      "recent_messages": 40,
+      "similarity_threshold": 0.9,
+      "similarity_lookback": 12,
+      "prompt": "Wtrąć się do rozmowy luźno i naturalnie. Nawiąż tylko lekko do ostatniego kontekstu kanału, jak uczestnik rozmowy, a nie moderator ani asystent. Napisz jedną krótką wiadomość: komentarz, żart, luźną obserwację albo krótkie pytanie. Odpowiedz tylko treścią wiadomości."
     }
   }
 }

@@ -12,7 +12,9 @@ import json
 import random
 import logging
 import openai
+import sqlite3
 import threading
+from difflib import SequenceMatcher
 from collections import defaultdict, deque
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -74,50 +76,318 @@ def start_config_watcher(config_path, callback):
 
 
 # ---------------------------------------------------------------------------
-# Per-channel message history (rolling time window)
+# SQLite-backed context store
 # ---------------------------------------------------------------------------
 
-class ChannelHistory:
-    """
-    Stores the last `max_window` seconds of PRIVMSG activity for a channel.
-    Each entry is a dict: {"ts": float, "nick": str, "text": str}.
-    """
+class SQLiteContextStore:
+    def __init__(
+        self,
+        db_path: str,
+        bot_nickname: str,
+        user_history_messages: int = 15,
+        channel_history_messages: int = 100,
+        isolate_user_context_per_channel: bool = True,
+    ):
+        self.db_path = db_path
+        self.bot_nickname = bot_nickname
+        self.user_history_messages = max(1, int(user_history_messages))
+        self.channel_history_messages = max(1, int(channel_history_messages))
+        self.isolate_user_context_per_channel = bool(isolate_user_context_per_channel)
+        self._lock = threading.RLock()
+        self._channel_cache = defaultdict(self._new_channel_cache)
+        self._conversation_cache = defaultdict(self._new_conversation_cache)
 
-    def __init__(self, max_window: int = 7200, max_messages: int = 200):
-        self.max_window = max_window      # seconds to keep (default 2 h)
-        self.max_messages = max_messages  # hard cap on stored messages
-        self._messages: deque = deque()
-        self._lock = threading.Lock()
+        db_dir = os.path.dirname(os.path.abspath(self.db_path))
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
 
-    def add(self, nick: str, text: str) -> None:
-        now = time.time()
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._initialize_schema()
+
+    def _initialize_schema(self) -> None:
         with self._lock:
-            self._messages.append({"ts": now, "nick": nick, "text": text})
-            self._prune(now)
+            self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    conversation_key TEXT NOT NULL,
+                    nick TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_channel_created_at "
+                "ON messages(channel, created_at DESC, id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_conversation_created_at "
+                "ON messages(conversation_key, created_at DESC, id DESC)"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS spontaneous_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_spontaneous_channel_created_at "
+                "ON spontaneous_messages(channel, created_at DESC, id DESC)"
+            )
+            self._conn.commit()
 
-    def _prune(self, now: float) -> None:
-        cutoff = now - self.max_window
-        while self._messages and self._messages[0]["ts"] < cutoff:
-            self._messages.popleft()
-        while len(self._messages) > self.max_messages:
-            self._messages.popleft()
+    def _new_channel_cache(self) -> deque:
+        return deque(maxlen=self.channel_history_messages)
 
-    def get_context_lines(self, now=None) -> list:
-        """Return lines formatted as '<nick> text' within the time window."""
-        if now is None:
-            now = time.time()
+    def _new_conversation_cache(self) -> deque:
+        return deque(maxlen=self.user_history_messages * 2)
+
+    def reconfigure(
+        self,
+        bot_nickname: str,
+        user_history_messages: int,
+        channel_history_messages: int,
+        isolate_user_context_per_channel: bool,
+    ) -> None:
         with self._lock:
-            self._prune(now)
-            return [f"{m['nick']}: {m['text']}" for m in self._messages]
+            self.bot_nickname = bot_nickname
+            self.user_history_messages = max(1, int(user_history_messages))
+            self.channel_history_messages = max(1, int(channel_history_messages))
+            self.isolate_user_context_per_channel = bool(isolate_user_context_per_channel)
+            self._channel_cache = defaultdict(
+                self._new_channel_cache,
+                {
+                    key: deque(list(cache)[-self.channel_history_messages:], maxlen=self.channel_history_messages)
+                    for key, cache in self._channel_cache.items()
+                },
+            )
+            conversation_maxlen = self.user_history_messages * 2
+            self._conversation_cache = defaultdict(
+                self._new_conversation_cache,
+                {
+                    key: deque(list(cache)[-conversation_maxlen:], maxlen=conversation_maxlen)
+                    for key, cache in self._conversation_cache.items()
+                },
+            )
 
-    def __len__(self) -> int:
+    def close(self) -> None:
         with self._lock:
-            return len(self._messages)
+            self._conn.close()
+
+    def conversation_key(self, channel: str, user: str, is_private: bool) -> str:
+        if is_private:
+            return f"pm:{user}"
+        if self.isolate_user_context_per_channel:
+            return f"channel:{channel}|user:{user}"
+        return f"user:{user}"
+
+    def add_message(
+        self,
+        channel: str,
+        user: str,
+        nick: str,
+        role: str,
+        text: str,
+        is_private: bool,
+        store_in_conversation: bool,
+        created_at: float | None = None,
+    ) -> None:
+        created_at = time.time() if created_at is None else created_at
+        scope = "pm" if is_private else "channel"
+        conversation_key = self.conversation_key(channel, user, is_private)
+        row = {
+            "channel": channel,
+            "scope": scope,
+            "conversation_key": conversation_key,
+            "nick": nick,
+            "role": role,
+            "text": text,
+            "created_at": created_at,
+        }
+
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO messages (channel, scope, conversation_key, nick, role, text, created_at)
+                VALUES (:channel, :scope, :conversation_key, :nick, :role, :text, :created_at)
+                """,
+                row,
+            )
+            self._conn.commit()
+            self._channel_cache[channel].append(row)
+            if store_in_conversation:
+                self._conversation_cache[conversation_key].append(row)
+
+    def _rows_to_messages(self, rows: list[sqlite3.Row]) -> list[dict]:
+        return [
+            {
+                "channel": row["channel"],
+                "scope": row["scope"],
+                "conversation_key": row["conversation_key"],
+                "nick": row["nick"],
+                "role": row["role"],
+                "text": row["text"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def _load_channel_cache(self, channel: str) -> None:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT channel, scope, conversation_key, nick, role, text, created_at
+                FROM messages
+                WHERE channel = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (channel, self.channel_history_messages),
+            ).fetchall()
+            self._channel_cache[channel] = deque(
+                reversed(self._rows_to_messages(rows)),
+                maxlen=self.channel_history_messages,
+            )
+
+    def _load_conversation_cache(self, conversation_key: str) -> None:
+        conversation_limit = self.user_history_messages * 2
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT channel, scope, conversation_key, nick, role, text, created_at
+                FROM messages
+                WHERE conversation_key = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (conversation_key, conversation_limit),
+            ).fetchall()
+            self._conversation_cache[conversation_key] = deque(
+                reversed(self._rows_to_messages(rows)),
+                maxlen=conversation_limit,
+            )
+
+    def get_channel_entries(
+        self,
+        channel: str,
+        limit: int | None = None,
+        since_seconds: int | None = None,
+        exclude_nicks: set[str] | None = None,
+    ) -> list[dict]:
+        requested_limit = limit or self.channel_history_messages
+        exclude_nicks = exclude_nicks or set()
+
+        if since_seconds is not None:
+            cutoff = time.time() - since_seconds
+            fetch_limit = max(requested_limit * 3, requested_limit)
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT channel, scope, conversation_key, nick, role, text, created_at
+                    FROM messages
+                    WHERE channel = ? AND created_at >= ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (channel, cutoff, fetch_limit),
+                ).fetchall()
+            entries = list(reversed(self._rows_to_messages(rows)))
+        else:
+            if not self._channel_cache[channel]:
+                self._load_channel_cache(channel)
+            entries = list(self._channel_cache[channel])
+
+        if exclude_nicks:
+            entries = [entry for entry in entries if entry["nick"] not in exclude_nicks]
+        return entries[-requested_limit:]
+
+    def get_channel_context_lines(
+        self,
+        channel: str,
+        limit: int | None = None,
+        since_seconds: int | None = None,
+        exclude_nicks: set[str] | None = None,
+    ) -> list[str]:
+        entries = self.get_channel_entries(
+            channel,
+            limit=limit,
+            since_seconds=since_seconds,
+            exclude_nicks=exclude_nicks,
+        )
+        return [f"{entry['nick']}: {entry['text']}" for entry in entries]
+
+    def get_channel_prompt_messages(
+        self,
+        channel: str,
+        limit: int | None = None,
+        since_seconds: int | None = None,
+    ) -> list[dict]:
+        entries = self.get_channel_entries(channel, limit=limit, since_seconds=since_seconds)
+        messages = []
+        for entry in entries:
+            role = entry["role"]
+            messages.append({"role": role, "content": f"{entry['nick']}: {entry['text']}"})
+        return messages
+
+    def get_conversation_messages(self, channel: str, user: str, is_private: bool) -> list[dict]:
+        conversation_key = self.conversation_key(channel, user, is_private)
+        if not self._conversation_cache[conversation_key]:
+            self._load_conversation_cache(conversation_key)
+        return [
+            {"role": entry["role"], "content": entry["text"]}
+            for entry in self._conversation_cache[conversation_key]
+        ]
+
+    def add_spontaneous_message(
+        self,
+        channel: str,
+        text: str,
+        created_at: float | None = None,
+    ) -> None:
+        created_at = time.time() if created_at is None else created_at
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO spontaneous_messages (channel, text, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (channel, text, created_at),
+            )
+            self._conn.commit()
+
+    def get_recent_spontaneous_messages(
+        self,
+        channel: str,
+        limit: int = 12,
+        since_seconds: int | None = None,
+    ) -> list[str]:
+        query = [
+            "SELECT text FROM spontaneous_messages WHERE channel = ?"
+        ]
+        params: list = [channel]
+        if since_seconds is not None:
+            query.append("AND created_at >= ?")
+            params.append(time.time() - since_seconds)
+        query.append("ORDER BY created_at DESC, id DESC LIMIT ?")
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(" ".join(query), params).fetchall()
+        return [row["text"] for row in rows]
 
 
 # Initialize ChatGPT context per user
 class ChatGPTBot:
-    def __init__(self, api_key, admin_prompt, model, chat_params):
+    def __init__(self, api_key, admin_prompt, model, chat_params, context_store):
         self.chat_params = chat_params
         self.model = model
         self._client = openai.OpenAI(
@@ -125,11 +395,22 @@ class ChatGPTBot:
             timeout=chat_params.get("request_timeout", 30),
         )
         self.admin_prompt = {"role": "system", "content": admin_prompt}  # Administrative prompt
-        self.user_context = defaultdict(list)
+        self.context_store = context_store
 
-    def respond(self, user, message):
+    def respond(self, channel, user, message, is_private=False):
         # Ensure the administrative prompt is included at the start of every interaction
-        context = [self.admin_prompt] + self.user_context[user]
+        context = [self.admin_prompt]
+        if not is_private:
+            channel_lines = self.context_store.get_channel_context_lines(
+                channel,
+                exclude_nicks={user, self.context_store.bot_nickname},
+            )
+            if channel_lines:
+                context.append({
+                    "role": "system",
+                    "content": "Recent channel context:\n" + "\n".join(channel_lines),
+                })
+        context.extend(self.context_store.get_conversation_messages(channel, user, is_private))
         context.append({"role": "user", "content": message})
 
         response = self._client.chat.completions.create(
@@ -141,13 +422,6 @@ class ChatGPTBot:
         )
 
         reply = response.choices[0].message.content
-        self.user_context[user].append({"role": "user", "content": message})
-        self.user_context[user].append({"role": "assistant", "content": reply})
-
-        # Limit context to a manageable size, keeping the admin prompt intact
-        if len(self.user_context[user]) > 20:
-            self.user_context[user] = self.user_context[user][-19:]  # Retain only the latest messages
-
         return reply
 
     def validate_api(self) -> None:
@@ -329,6 +603,7 @@ class IRCBot:
     RECONNECT_MAX_DELAY = 60  # cap for exponential backoff
 
     def __init__(self, config):
+        self.config = config
         self.admin_prompt = config["admin_prompt"]
         # Support both old single-server format and new list format
         if "servers" in config:
@@ -342,14 +617,41 @@ class IRCBot:
         self.usessl = config["usessl"]
         self.password = config.get("password")
         self.chat_params = config["chat_params"]
-        self.chatgpt_bot = ChatGPTBot(config["openai_api_key"], config["admin_prompt"], config["model"], config["chat_params"])
+        self.context_store = self._build_context_store(config)
+        self.chatgpt_bot = ChatGPTBot(
+            config["openai_api_key"],
+            config["admin_prompt"],
+            config["model"],
+            config["chat_params"],
+            self.context_store,
+        )
         self.irc = None
         self._connected = False
         # Per-channel spontaneous message config and history
         self._spontaneous_cfg: dict = {}   # channel -> cfg dict
-        self._channel_history = {}  # channel -> ChannelHistory
         self._spontaneous_next: dict[str, float] = {}  # channel -> next fire timestamp
         self._reload_spontaneous_config(config)
+
+    def _context_config(self, cfg: dict) -> dict:
+        context_cfg = cfg.get("context", {})
+        return {
+            "database_path": context_cfg.get("database_path", "./context.sqlite3"),
+            "user_history_messages": int(context_cfg.get("user_history_messages", 15)),
+            "channel_history_messages": int(context_cfg.get("channel_history_messages", 100)),
+            "isolate_user_context_per_channel": bool(
+                context_cfg.get("isolate_user_context_per_channel", True)
+            ),
+        }
+
+    def _build_context_store(self, cfg: dict) -> SQLiteContextStore:
+        context_cfg = self._context_config(cfg)
+        return SQLiteContextStore(
+            context_cfg["database_path"],
+            cfg["nickname"],
+            user_history_messages=context_cfg["user_history_messages"],
+            channel_history_messages=context_cfg["channel_history_messages"],
+            isolate_user_context_per_channel=context_cfg["isolate_user_context_per_channel"],
+        )
 
     def _reload_spontaneous_config(self, cfg: dict) -> None:
         """Parse per-channel spontaneous message settings from config."""
@@ -364,19 +666,19 @@ class IRCBot:
                 "min_interval": int(opts.get("min_interval", 1800)),
                 "max_interval": int(opts.get("max_interval", 3600)),
                 "min_messages": int(opts.get("min_messages", 50)),
+                "recent_messages": int(opts.get("recent_messages", 40)),
+                "similarity_threshold": float(opts.get("similarity_threshold", 0.9)),
+                "similarity_lookback": int(opts.get("similarity_lookback", 12)),
                 "prompt": opts.get(
                     "prompt",
-                    "Dołącz spontanicznie do tej rozmowy — napisz jedną krótką wiadomość "
-                    "nawiązującą do tego, o czym właśnie rozmawiają. "
-                    "Odpowiedz TYLKO treścią wiadomości, bez żadnych dodatkowych komentarzy.",
+                    "Wtrąć się do rozmowy luźno i naturalnie. Nawiąż tylko lekko do "
+                    "ostatniego kontekstu kanału, jak uczestnik rozmowy, a nie moderator "
+                    "ani asystent. Napisz jedną krótką wiadomość: komentarz, żart, luźną "
+                    "obserwację albo krótkie pytanie. Nie streszczaj rozmowy, nie wyjaśniaj "
+                    "że się włączasz i nie używaj cudzysłowów ani wstępów. Odpowiedz tylko "
+                    "treścią wiadomości.",
                 ),
             }
-            # Create or resize ChannelHistory
-            window = new_cfg[channel]["history_window"]
-            if channel not in self._channel_history:
-                self._channel_history[channel] = ChannelHistory(max_window=window)
-            else:
-                self._channel_history[channel].max_window = window
             # Schedule first fire only if not already scheduled
             if channel not in self._spontaneous_next:
                 self._schedule_next(channel, new_cfg[channel])
@@ -403,39 +705,56 @@ class IRCBot:
                     continue
                 if now < self._spontaneous_next.get(channel, 0):
                     continue
-                history = self._channel_history.get(channel)
-                if history is None or len(history) < cfg["min_messages"]:
+                lines = self.context_store.get_channel_context_lines(
+                    channel,
+                    limit=cfg["recent_messages"],
+                    since_seconds=cfg["history_window"],
+                )
+                if len(lines) < cfg["min_messages"]:
                     # Not enough context yet – reschedule
                     self._schedule_next(channel, cfg)
                     continue
-                lines = history.get_context_lines(now)
                 self._send_spontaneous(channel, cfg, lines)
                 self._schedule_next(channel, cfg)
 
-    def _send_spontaneous(self, channel: str, cfg: dict, history_lines: list) -> None:
+    def _send_spontaneous(self, channel: str, cfg: dict, _history_lines: list) -> None:
         """Ask the model for a spontaneous message and send it to the channel.
 
         The channel history is passed as individual chat messages so the model
-        sees a real conversation rather than a flat block of text.  Each IRC
-        line '<nick> text' is mapped to a 'user' role message.  Lines sent by
-        the bot itself are mapped to 'assistant' so the model knows its own
-        prior contributions.
+        sees a real conversation rather than a flat block of text.
         """
-        recent_lines = history_lines[-60:]  # at most 60 most-recent lines
-
-        # Build messages list: system prompt + channel history as chat turns
+        recent_spontaneous = self.context_store.get_recent_spontaneous_messages(
+            channel,
+            limit=cfg["similarity_lookback"],
+            since_seconds=cfg["history_window"],
+        )
+        recent_messages = self.context_store.get_channel_prompt_messages(
+            channel,
+            limit=cfg["recent_messages"],
+            since_seconds=cfg["history_window"],
+        )
         messages = [
             {"role": "system", "content": self.chatgpt_bot.admin_prompt["content"]},
+            {
+                "role": "system",
+                "content": (
+                    "Masz brzmieć jak zwykły uczestnik IRC. Wtrącaj się oszczędnie, "
+                    "lekko i naturalnie, tylko miękko zahaczając o bieżący temat. "
+                    "Unikaj tonów formalnych, podsumowań, poradnika i powtarzania "
+                    "tego samego pomysłu."
+                ),
+            },
         ]
-        for line in recent_lines:
-            # line format: "<nick> text"
-            if line.startswith(f"<{self.nickname}>"):
-                role = "assistant"
-                text = line[len(f"<{self.nickname}> "):]
-            else:
-                role = "user"
-                text = line
-            messages.append({"role": role, "content": text})
+        messages.extend(recent_messages)
+        if recent_spontaneous:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Nie powtarzaj ani nie parafrazuj zbyt blisko własnych poprzednich "
+                    "spontanicznych wiadomości. Oto ostatnie takie wiadomości:\n- "
+                    + "\n- ".join(recent_spontaneous)
+                ),
+            })
 
         # Final instruction — ask the model to chime in spontaneously
         messages.append({
@@ -445,7 +764,7 @@ class IRCBot:
 
         try:
             self.logger.info(f"Sending spontaneous message to {channel} "
-                             f"(context: {len(recent_lines)} lines)")
+                             f"(context: {len(recent_messages)} lines)")
             cp = self.chatgpt_bot.chat_params
             api_response = self.chatgpt_bot._client.chat.completions.create(
                 model=self.chatgpt_bot.model,
@@ -456,17 +775,42 @@ class IRCBot:
             )
             response = api_response.choices[0].message.content.replace("\n", " ").strip()
             if response:
+                if self._is_similar_spontaneous(channel, response, cfg):
+                    self.logger.info(
+                        "Skipping spontaneous message for %s because it is too similar to a prior one",
+                        channel,
+                    )
+                    return
                 irc_chunks = self.split_into_irc_chunks(response, 400)
                 for i, chunk in enumerate(irc_chunks):
                     self.send(f"PRIVMSG {channel} :{chunk}")
+                    self.context_store.add_message(
+                        channel=channel,
+                        user=self.nickname,
+                        nick=self.nickname,
+                        role="assistant",
+                        text=chunk,
+                        is_private=False,
+                        store_in_conversation=False,
+                    )
                     if i < len(irc_chunks) - 1:
                         time.sleep(0.5)
+                self.context_store.add_spontaneous_message(channel, response)
         except Exception as e:
             self.logger.error(f"Error sending spontaneous message to {channel}: {e}")
 
     def update_config(self, new_config):
         """Update bot configuration dynamically."""
         self.logger.info("Updating configuration...")
+        old_context_store = self.context_store
+        context_cfg = self._context_config(new_config)
+        reuse_context_store = (
+            os.path.abspath(context_cfg["database_path"]) == os.path.abspath(self.context_store.db_path)
+        )
+        if os.path.abspath(context_cfg["database_path"]) == os.path.abspath(self.context_store.db_path):
+            context_store = self.context_store
+        else:
+            context_store = self._build_context_store(new_config)
 
         # Reinitialize ChatGPT bot if the API key, model or chat_params change
         new_bot = ChatGPTBot(
@@ -474,6 +818,7 @@ class IRCBot:
             new_config.get("admin_prompt", self.admin_prompt),
             new_config.get("model", self.chatgpt_bot.model),
             new_config.get("chat_params", self.chatgpt_bot.chat_params),
+            context_store,
         )
         try:
             new_bot.validate_api()
@@ -481,12 +826,23 @@ class IRCBot:
             self.logger.error(
                 f"Config reload aborted — OpenAI API validation failed: {e}"
             )
+            if context_store is not old_context_store:
+                context_store.close()
             return
-        # Preserve per-user conversation history across config reloads
-        new_bot.user_context = self.chatgpt_bot.user_context
+        if reuse_context_store:
+            context_store.reconfigure(
+                bot_nickname=new_config.get("nickname", self.nickname),
+                user_history_messages=context_cfg["user_history_messages"],
+                channel_history_messages=context_cfg["channel_history_messages"],
+                isolate_user_context_per_channel=context_cfg["isolate_user_context_per_channel"],
+            )
         self.chatgpt_bot = new_bot
+        self.context_store = context_store
         self.config = new_config
+        self.nickname = new_config.get("nickname", self.nickname)
         self._reload_spontaneous_config(new_config)
+        if context_store is not old_context_store:
+            old_context_store.close()
 
     def _next_server(self):
         """Rotate to the next server in the list (round-robin)."""
@@ -593,6 +949,74 @@ class IRCBot:
             return _INJECTION_WARNING + text
         return text
 
+    def _store_channel_message(self, channel: str, nick: str, text: str) -> None:
+        sanitized_text = text if nick == self.nickname else self.sanitize_prompt(nick, text)
+        self.context_store.add_message(
+            channel=channel,
+            user=nick,
+            nick=nick,
+            role="assistant" if nick == self.nickname else "user",
+            text=sanitized_text,
+            is_private=False,
+            store_in_conversation=False,
+        )
+
+    def _store_conversation_message(
+        self,
+        channel: str,
+        user: str,
+        nick: str,
+        role: str,
+        text: str,
+        is_private: bool,
+    ) -> None:
+        self.context_store.add_message(
+            channel=channel,
+            user=user,
+            nick=nick,
+            role=role,
+            text=text if role == "assistant" else self.sanitize_prompt(user, text),
+            is_private=is_private,
+            store_in_conversation=True,
+        )
+
+    def _normalize_spontaneous_text(self, text: str) -> str:
+        normalized = text.lower().strip()
+        normalized = re.sub(r"https?://\S+", "", normalized)
+        normalized = re.sub(r"[^\w\s]", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    def _is_similar_spontaneous(self, channel: str, candidate: str, cfg: dict) -> bool:
+        normalized_candidate = self._normalize_spontaneous_text(candidate)
+        if not normalized_candidate:
+            return True
+        previous_messages = self.context_store.get_recent_spontaneous_messages(
+            channel,
+            limit=cfg["similarity_lookback"],
+            since_seconds=cfg["history_window"],
+        )
+        candidate_tokens = set(normalized_candidate.split())
+        threshold = cfg["similarity_threshold"]
+
+        for previous in previous_messages:
+            normalized_previous = self._normalize_spontaneous_text(previous)
+            if not normalized_previous:
+                continue
+            if normalized_previous == normalized_candidate:
+                return True
+            sequence_ratio = SequenceMatcher(None, normalized_previous, normalized_candidate).ratio()
+            previous_tokens = set(normalized_previous.split())
+            union = candidate_tokens | previous_tokens
+            overlap_ratio = (
+                len(candidate_tokens & previous_tokens) / len(union) if union else 1.0
+            )
+            if sequence_ratio >= threshold:
+                return True
+            if sequence_ratio >= (threshold - 0.08) and overlap_ratio >= 0.75:
+                return True
+        return False
+
     def split_into_irc_chunks(self, text, max_length):
         """
         Split text into chunks that fit within max_length.
@@ -672,43 +1096,74 @@ class IRCBot:
         if channel == self.nickname:
             channel = user
             self.logger.debug(f"Direct message from {user}, replying privately")
+            is_private = True
+        else:
+            is_private = False
 
-        # Record message in channel history (before handling bot commands)
-        if channel in self._channel_history:
-            self._channel_history[channel].add(user, msg_content)
+        is_addressed = is_private or msg_content.startswith(self.nickname)
+        if not is_addressed:
+            self._store_channel_message(channel, user, msg_content)
+            return
 
-        if msg_content.startswith(self.nickname):
-            max_length = 500
-            prompt = msg_content.split(self.nickname, 1)[1].strip().lstrip(":")
-            self.logger.debug(f"Bot addressed by {user} in {channel}, prompt: {prompt!r}")
-            prompt = self.sanitize_prompt(user, prompt)
+        max_length = 500
+        prompt = msg_content if is_private else msg_content.split(self.nickname, 1)[1].strip().lstrip(":")
+        self.logger.debug(f"Bot addressed by {user} in {channel}, prompt: {prompt!r}")
+        sanitized_prompt = self.sanitize_prompt(user, prompt)
 
-            chunks = [prompt[i:i + max_length] for i in range(0, len(prompt), max_length)]
-            if len(chunks) > 1:
-                self.logger.debug(f"Prompt split into {len(chunks)} chunks for ChatGPT")
+        chunks = [
+            sanitized_prompt[i:i + max_length]
+            for i in range(0, len(sanitized_prompt), max_length)
+        ]
+        if len(chunks) > 1:
+            self.logger.debug(f"Prompt split into {len(chunks)} chunks for ChatGPT")
 
-            self.logger.debug(f"Querying ChatGPT for {user}...")
+        self.logger.debug(f"Querying ChatGPT for {user}...")
+        try:
+            responses = [
+                self.chatgpt_bot.respond(channel, user, chunk, is_private=is_private)
+                for chunk in chunks
+            ]
+        except Exception as e:
+            self.logger.error(f"OpenAI API error for {user}: {e}")
+            if not is_private:
+                self._store_channel_message(channel, user, msg_content)
+            error_text = f"[błąd API: {e}]" if is_private else f"{user}: [błąd API: {e}]"
+            self.send(f"PRIVMSG {channel} :{error_text}")
+            return
+        response = ' '.join(responses).replace('\n', ' ').strip()
+        self.logger.debug(f"ChatGPT response for {user}: {response!r}")
+
+        if not is_private:
+            self._store_channel_message(channel, user, msg_content)
+        self._store_conversation_message(channel, user, user, "user", prompt, is_private)
+
+        # Split response into balanced IRC-sized chunks
+        irc_chunks = self.split_into_irc_chunks(response, 400)
+        self.logger.debug(f"Sending {len(irc_chunks)} IRC message(s) to {channel}")
+
+        all_sent = True
+        for i, chunk in enumerate(irc_chunks):
             try:
-                responses = [self.chatgpt_bot.respond(user, chunk) for chunk in chunks]
+                outgoing = f"{user}: {chunk}" if i == 0 and not is_private else chunk
+                message = f"PRIVMSG {channel} :{outgoing}"
+                self.send(message)
+                if not is_private:
+                    self._store_channel_message(channel, self.nickname, outgoing)
+                time.sleep(0.5)
             except Exception as e:
-                self.logger.error(f"OpenAI API error for {user}: {e}")
-                self.send(f"PRIVMSG {channel} :{user}: [błąd API: {e}]")
-                return
-            response = ' '.join(responses).replace('\n', ' ').strip()
-            self.logger.debug(f"ChatGPT response for {user}: {response!r}")
+                self.logger.error(f"Error sending message chunk {i+1}: {e}")
+                all_sent = False
+                break
 
-            # Split response into balanced IRC-sized chunks
-            irc_chunks = self.split_into_irc_chunks(response, 400)
-            self.logger.debug(f"Sending {len(irc_chunks)} IRC message(s) to {channel}")
-
-            for i, chunk in enumerate(irc_chunks):
-                try:
-                    message = f"PRIVMSG {channel} :{user}: {chunk}" if i == 0 else f"PRIVMSG {channel} :{chunk}"
-                    self.send(message)
-                    time.sleep(0.5)
-                except Exception as e:
-                    self.logger.error(f"Error sending message chunk {i+1}: {e}")
-                    break
+        if all_sent and response:
+            self._store_conversation_message(
+                channel,
+                user,
+                self.nickname,
+                "assistant",
+                response,
+                is_private,
+            )
 
     def run(self):
         """Connect and keep reconnecting on disconnect."""
