@@ -358,53 +358,13 @@ class ChatGPTBot:
         self.admin_prompt = {"role": "system", "content": admin_prompt}  # Administrative prompt
         self.context_store = context_store
 
-    def _estimate_prompt_tokens(self, messages: list[dict]) -> int:
-        total_chars = 0
-        for message in messages:
-            total_chars += len(message.get("role", ""))
-            total_chars += len(message.get("content", ""))
-        return max(1, total_chars // 4)
-
     def _uses_responses_api(self) -> bool:
         return self.model.startswith("gpt-5")
 
-    def completion_token_budget(
-        self,
-        messages: list[dict],
-        min_tokens_override: int | None = None,
-        max_tokens_override: int | None = None,
-    ) -> int:
-        estimated_input_tokens = self._estimate_prompt_tokens(messages)
-        min_tokens = int(
-            min_tokens_override
-            if min_tokens_override is not None
-            else self.chat_params.get("min_response_tokens", 80)
-        )
-        max_tokens = int(
-            max_tokens_override
-            if max_tokens_override is not None
-            else self.chat_params.get(
-                "max_response_tokens",
-                self.chat_params.get("max_tokens", 220),
-            )
-        )
-        ratio = float(self.chat_params.get("response_tokens_ratio", 0.35))
-        computed_tokens = int(estimated_input_tokens * ratio)
-        if max_tokens < min_tokens:
-            max_tokens = min_tokens
-        return max(min_tokens, min(max_tokens, computed_tokens))
-
-    def _request_completion(
-        self,
-        messages: list[dict],
-        min_tokens_override: int | None = None,
-        max_tokens_override: int | None = None,
-    ):
-        completion_tokens = self.completion_token_budget(
-            messages,
-            min_tokens_override=min_tokens_override,
-            max_tokens_override=max_tokens_override,
-        )
+    def _request_completion(self, messages: list[dict], max_tokens_override: int | None = None):
+        completion_tokens = int(self.chat_params.get("max_tokens", 300))
+        if max_tokens_override is not None:
+            completion_tokens = int(max_tokens_override)
         if self._uses_responses_api():
             request = {
                 "model": self.model,
@@ -434,28 +394,6 @@ class ChatGPTBot:
 
     def generate_reply(self, messages: list[dict]) -> str:
         response = self._request_completion(messages)
-        reply = self._extract_reply_text(response)
-        if reply:
-            return reply
-
-        retry_tokens = int(
-            self.chat_params.get(
-                "empty_response_retry_tokens",
-                max(
-                    self.chat_params.get("max_response_tokens", 220),
-                    480,
-                ),
-            )
-        )
-        logger.warning(
-            "Model returned an empty response; retrying with a larger completion budget (%d tokens).",
-            retry_tokens,
-        )
-        response = self._request_completion(
-            messages,
-            min_tokens_override=retry_tokens,
-            max_tokens_override=retry_tokens,
-        )
         reply = self._extract_reply_text(response)
         if reply:
             return reply
@@ -490,7 +428,6 @@ class ChatGPTBot:
         )
         self._request_completion(
             [{"role": "user", "content": "ping"}],
-            min_tokens_override=16,
             max_tokens_override=32,
         )
         logger.info("OpenAI API validation successful.")
