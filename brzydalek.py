@@ -366,18 +366,79 @@ class ChatGPTBot:
             total_chars += len(message.get("content", ""))
         return max(1, total_chars // 4)
 
-    def completion_token_budget(self, messages: list[dict]) -> int:
+    def completion_token_budget(
+        self,
+        messages: list[dict],
+        min_tokens_override: int | None = None,
+        max_tokens_override: int | None = None,
+    ) -> int:
         estimated_input_tokens = self._estimate_prompt_tokens(messages)
-        min_tokens = int(self.chat_params.get("min_response_tokens", 80))
+        min_tokens = int(
+            min_tokens_override
+            if min_tokens_override is not None
+            else self.chat_params.get("min_response_tokens", 80)
+        )
         max_tokens = int(
-            self.chat_params.get(
+            max_tokens_override
+            if max_tokens_override is not None
+            else self.chat_params.get(
                 "max_response_tokens",
                 self.chat_params.get("max_tokens", 220),
             )
         )
         ratio = float(self.chat_params.get("response_tokens_ratio", 0.35))
         computed_tokens = int(estimated_input_tokens * ratio)
+        if max_tokens < min_tokens:
+            max_tokens = min_tokens
         return max(min_tokens, min(max_tokens, computed_tokens))
+
+    def _request_completion(
+        self,
+        messages: list[dict],
+        min_tokens_override: int | None = None,
+        max_tokens_override: int | None = None,
+    ):
+        completion_tokens = self.completion_token_budget(
+            messages,
+            min_tokens_override=min_tokens_override,
+            max_tokens_override=max_tokens_override,
+        )
+        return self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=self.chat_params["temperature"],
+            max_completion_tokens=completion_tokens,
+            top_p=self.chat_params["top_p"],
+        )
+
+    def generate_reply(self, messages: list[dict]) -> str:
+        response = self._request_completion(messages)
+        reply = (response.choices[0].message.content or "").strip()
+        if reply:
+            return reply
+
+        retry_tokens = int(
+            self.chat_params.get(
+                "empty_response_retry_tokens",
+                max(
+                    self.chat_params.get("max_response_tokens", 220),
+                    480,
+                ),
+            )
+        )
+        logger.warning(
+            "Model returned an empty response; retrying with a larger completion budget (%d tokens).",
+            retry_tokens,
+        )
+        response = self._request_completion(
+            messages,
+            min_tokens_override=retry_tokens,
+            max_tokens_override=retry_tokens,
+        )
+        reply = (response.choices[0].message.content or "").strip()
+        if reply:
+            return reply
+        raise ValueError("Model returned an empty response.")
 
     def respond(self, channel, user, message, is_private=False):
         # Ensure the administrative prompt is included at the start of every interaction
@@ -394,18 +455,7 @@ class ChatGPTBot:
                 })
         context.extend(self.context_store.get_conversation_messages(channel, user, is_private))
         context.append({"role": "user", "content": message})
-        completion_tokens = self.completion_token_budget(context)
-
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=context,
-            temperature=self.chat_params["temperature"],
-            max_completion_tokens=completion_tokens,
-            top_p=self.chat_params["top_p"],
-        )
-
-        reply = response.choices[0].message.content
-        return reply
+        return self.generate_reply(context)
 
     def validate_api(self) -> None:
         """
@@ -755,16 +805,7 @@ class IRCBot:
                 channel,
                 len(recent_messages),
             )
-            cp = self.chatgpt_bot.chat_params
-            completion_tokens = self.chatgpt_bot.completion_token_budget(messages)
-            api_response = self.chatgpt_bot._client.chat.completions.create(
-                model=self.chatgpt_bot.model,
-                messages=messages,
-                temperature=cp["temperature"],
-                max_completion_tokens=completion_tokens,
-                top_p=cp["top_p"],
-            )
-            response = api_response.choices[0].message.content.replace("\n", " ").strip()
+            response = self.chatgpt_bot.generate_reply(messages).replace("\n", " ").strip()
             if response:
                 if self._is_similar_spontaneous(channel, response, cfg):
                     self.logger.info(
