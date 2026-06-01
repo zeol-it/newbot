@@ -35,6 +35,15 @@ class IncompleteResponseError(Exception):
         super().__init__(f"Responses API incomplete: status={status!r}, reason={reason!r}")
 
 
+_TOO_LONG_REPLIES = [
+    "to zadanie jest zdecydowanie za duże na mój mały rozumek — może dałbyś coś prostszego?",
+    "mój skromny procesorek już dymi, a odpowiedź jeszcze nie gotowa. może skróć pytanie?",
+    "za długie, za trudne, za bardzo. mały ja, wielkie zadanie — to nie działa. spróbuj czegoś mniejszego.",
+    "przerastasz moje możliwości intelektualne. mógłbyś podzielić to na mniejsze kawałki?",
+    "mój rozumek już machał białą flagą w połowie. może w kilku częściach?",
+    "to przekracza moje skromne zdolności obliczeniowe. upraszczaj, proszę.",
+]
+
 # Load configuration from a file
 CONFIG_FILE = "./bot_config.json"
 def load_config():
@@ -1181,6 +1190,10 @@ class IRCBot:
             )
             if not is_private:
                 self._store_channel_message(channel, user, msg_content)
+            if e.reason == "max_output_tokens":
+                reply = random.choice(_TOO_LONG_REPLIES)
+                outgoing = reply if is_private else f"{user}: {reply}"
+                self.send(f"PRIVMSG {channel} :{outgoing}")
             return
         except Exception as e:
             self.logger.error(
