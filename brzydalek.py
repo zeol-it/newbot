@@ -27,6 +27,14 @@ logging.basicConfig(
 logger = logging.getLogger("chatbot")
 
 
+class IncompleteResponseError(Exception):
+    """Raised when the Responses API returns status='incomplete'."""
+    def __init__(self, status: str, reason: str | None = None):
+        self.status = status
+        self.reason = reason
+        super().__init__(f"Responses API incomplete: status={status!r}, reason={reason!r}")
+
+
 # Load configuration from a file
 CONFIG_FILE = "./bot_config.json"
 def load_config():
@@ -391,26 +399,51 @@ class ChatGPTBot:
         if self._uses_responses_api():
             text = (response.output_text or "").strip()
             if not text:
+                status = getattr(response, "status", None)
+                incomplete_details = getattr(response, "incomplete_details", None)
+                reason = getattr(incomplete_details, "reason", None) if incomplete_details else None
+                model = getattr(response, "model", None)
+                usage = getattr(response, "usage", None)
                 logger.warning(
-                    "Responses API returned empty output_text. status=%r",
-                    getattr(response, "status", None),
+                    "Responses API returned empty output_text. "
+                    "status=%r, reason=%r, model=%r, usage=%r",
+                    status,
+                    reason,
+                    model,
+                    usage,
                 )
+                if status == "incomplete":
+                    raise IncompleteResponseError(status=status, reason=reason)
             return text
 
         choice = response.choices[0]
         finish_reason = choice.finish_reason
         message = choice.message
+        model = getattr(response, "model", None)
+        usage = getattr(response, "usage", None)
 
         # Newer models signal a refusal via message.refusal instead of content
         refusal = getattr(message, "refusal", None)
         if refusal:
-            logger.warning("Model refused the request: %r", refusal)
+            logger.warning(
+                "Model refused the request. finish_reason=%r, model=%r, usage=%r, refusal=%r",
+                finish_reason,
+                model,
+                usage,
+                refusal,
+            )
             return refusal.strip()
 
         content = (message.content or "").strip()
         if not content:
+            tool_calls = getattr(message, "tool_calls", None)
             logger.warning(
-                "Model returned empty content. finish_reason=%r", finish_reason
+                "Model returned empty content. "
+                "finish_reason=%r, model=%r, usage=%r, tool_calls=%r",
+                finish_reason,
+                model,
+                usage,
+                tool_calls,
             )
         return content
 
@@ -1141,12 +1174,21 @@ class IRCBot:
                 self.chatgpt_bot.respond(channel, user, chunk, is_private=is_private)
                 for chunk in chunks
             ]
-        except Exception as e:
-            self.logger.error(f"OpenAI API error for {user}: {e}")
+        except IncompleteResponseError as e:
+            self.logger.warning(
+                "Incomplete response, not sending to IRC. user=%s channel=%s status=%r reason=%r",
+                user, channel, e.status, e.reason,
+            )
             if not is_private:
                 self._store_channel_message(channel, user, msg_content)
-            error_text = f"[błąd API: {e}]" if is_private else f"{user}: [błąd API: {e}]"
-            self.send(f"PRIVMSG {channel} :{error_text}")
+            return
+        except Exception as e:
+            self.logger.error(
+                "OpenAI API error, not sending to IRC. user=%s channel=%s error=%r",
+                user, channel, e,
+            )
+            if not is_private:
+                self._store_channel_message(channel, user, msg_content)
             return
         response = ' '.join(responses).replace('\n', ' ').strip()
         self.logger.info(
