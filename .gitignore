@@ -166,3 +166,4 @@ cython_debug/
 # Temporary for not storing config with key
 bot_config.json
 *.ini
+*.pid 

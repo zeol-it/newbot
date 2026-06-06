@@ -9,10 +9,13 @@ except ImportError:
     _LANGDETECT_AVAILABLE = False
 import ssl
 import os
+import sys
 import time
 import json
 import random
+import signal
 import logging
+import argparse
 import openai
 import sqlite3
 import threading
@@ -46,6 +49,8 @@ _TOO_LONG_REPLIES = [
 
 # Load configuration from a file
 CONFIG_FILE = "./bot_config.json"
+PID_FILE = "./brzydalek.pid"
+
 def load_config():
     with open(CONFIG_FILE, "r") as f:
         return json.load(f)
@@ -897,6 +902,16 @@ class IRCBot:
         self.context_store = context_store
         self.config = new_config
         self.nickname = new_config.get("nickname", self.nickname)
+
+        # Join new channels that weren't in the previous config
+        new_channels = new_config.get("channels", self.channels)
+        if self._connected:
+            for channel in new_channels:
+                if channel not in self.channels:
+                    self.logger.info(f"Joining new channel from config: {channel}")
+                    self.send(f"JOIN {channel}")
+        self.channels = new_channels
+
         self._reload_spontaneous_config(new_config)
         if context_store is not old_context_store:
             old_context_store.close()
@@ -1257,10 +1272,52 @@ class IRCBot:
                 self._close_socket()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Brzydalek IRC bot")
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Przeładuj konfigurację działającego bota i zakończ",
+    )
+    args = parser.parse_args()
+
+    if args.reload:
+        if not os.path.exists(PID_FILE):
+            print(f"Plik PID nie istnieje: {PID_FILE}", file=sys.stderr)
+            sys.exit(1)
+        with open(PID_FILE) as _f:
+            _pid = int(_f.read().strip())
+        try:
+            os.kill(_pid, signal.SIGUSR1)
+            print(f"Wysłano SIGUSR1 do procesu {_pid} — konfiguracja zostanie przeładowana.")
+        except ProcessLookupError:
+            print(f"Proces {_pid} nie istnieje.", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
     bot = IRCBot(config)
-    # try:
-    #     bot.chatgpt_bot.validate_api()
-    # except Exception as e:
-    #     logger.error(f"OpenAI API validation failed: {e}")
-    #     raise SystemExit(1)
-    bot.run()
+
+    def _reload_handler(signum, frame):
+        logger.info("Otrzymano SIGUSR1 — przeładowywanie konfiguracji...")
+        try:
+            new_cfg = load_config()
+            bot.update_config(new_cfg)
+            logger.info("Konfiguracja przeładowana pomyślnie.")
+        except Exception as _e:
+            logger.error(f"Błąd podczas przeładowywania konfiguracji: {_e}")
+
+    signal.signal(signal.SIGUSR1, _reload_handler)
+
+    with open(PID_FILE, "w") as _f:
+        _f.write(str(os.getpid()))
+    try:
+        # try:
+        #     bot.chatgpt_bot.validate_api()
+        # except Exception as e:
+        #     logger.error(f"OpenAI API validation failed: {e}")
+        #     raise SystemExit(1)
+        bot.run()
+    finally:
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
