@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+import codecs
 import re
 import socket
 try:
@@ -479,7 +480,11 @@ class ChatGPTBot:
             if channel_lines:
                 context.append({
                     "role": "system",
-                    "content": "Recent channel context:\n" + "\n".join(channel_lines),
+                    "content": (
+                        "Recent channel context (helper only). Use it only if it is relevant "
+                        "to the current reply; otherwise ignore it and answer naturally.\n"
+                        + "\n".join(channel_lines)
+                    ),
                 })
         context.extend(self.context_store.get_conversation_messages(channel, user, is_private))
         context.append({"role": "user", "content": message})
@@ -803,7 +808,9 @@ class IRCBot:
                     "Masz brzmieć jak zwykły uczestnik IRC. Wtrącaj się oszczędnie, "
                     "lekko i naturalnie, tylko miękko zahaczając o bieżący temat. "
                     "Unikaj tonów formalnych, podsumowań, poradnika i powtarzania "
-                    "tego samego pomysłu."
+                    "tego samego pomysłu. Kontekst ostatnich wiadomości traktuj "
+                    "pomocniczo: uwzględnij go tylko jeśli jest istotny dla wypowiedzi, "
+                    "w przeciwnym razie zignoruj."
                 ),
             },
         ]
@@ -981,9 +988,13 @@ class IRCBot:
 
     def listen(self):
         buffer = ""
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         while True:
             try:
-                buffer += self.irc.recv(4096).decode("utf-8")
+                data = self.irc.recv(4096)
+                if not data:
+                    raise ConnectionError("Socket closed by remote host")
+                buffer += decoder.decode(data)
                 lines = buffer.split("\r\n")
                 buffer = lines.pop()
 
@@ -1089,12 +1100,20 @@ class IRCBot:
                 return True
         return False
 
+    def _strip_self_nick_prefix(self, text: str) -> str:
+        """Remove leading self nickname formatting like 'brzydalek: ...'."""
+        if not text:
+            return ""
+        pattern = rf"^\s*{re.escape(self.nickname)}\s*[:,\-]\s*"
+        return re.sub(pattern, "", text, count=1, flags=re.IGNORECASE).strip()
+
     def split_into_irc_chunks(self, text, max_length):
         """
         Split text into chunks that fit within max_length.
 
         Break priority (highest to lowest):
-          1. After a sentence-ending punctuation (. ! ?) followed by whitespace
+            response = self.chatgpt_bot.generate_reply(messages).replace("\n", " ").strip()
+            response = self._strip_self_nick_prefix(response)
              or end of string.
           2. After a clause-ending punctuation (, ; :) followed by whitespace.
           3. Between words (fallback — no mid-word splits).
