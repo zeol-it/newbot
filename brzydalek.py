@@ -71,12 +71,14 @@ class SQLiteContextStore:
         user_history_messages: int = 15,
         channel_history_messages: int = 100,
         isolate_user_context_per_channel: bool = True,
+        retention_days: int | None = 90,
     ):
         self.db_path = db_path
         self.bot_nickname = bot_nickname
         self.user_history_messages = max(1, int(user_history_messages))
         self.channel_history_messages = max(1, int(channel_history_messages))
         self.isolate_user_context_per_channel = bool(isolate_user_context_per_channel)
+        self.retention_days = max(1, int(retention_days if retention_days is not None else 90))
         self._lock = threading.RLock()
         self._channel_cache = defaultdict(self._new_channel_cache)
         self._conversation_cache = defaultdict(self._new_conversation_cache)
@@ -88,6 +90,7 @@ class SQLiteContextStore:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._initialize_schema()
+        self.prune_old_messages()
 
     def _initialize_schema(self) -> None:
         with self._lock:
@@ -142,12 +145,15 @@ class SQLiteContextStore:
         user_history_messages: int,
         channel_history_messages: int,
         isolate_user_context_per_channel: bool,
+        retention_days: int | None = None,
     ) -> None:
         with self._lock:
             self.bot_nickname = bot_nickname
             self.user_history_messages = max(1, int(user_history_messages))
             self.channel_history_messages = max(1, int(channel_history_messages))
             self.isolate_user_context_per_channel = bool(isolate_user_context_per_channel)
+            if retention_days is not None:
+                self.retention_days = max(1, int(retention_days))
             self._channel_cache = defaultdict(
                 self._new_channel_cache,
                 {
@@ -163,6 +169,25 @@ class SQLiteContextStore:
                     for key, cache in self._conversation_cache.items()
                 },
             )
+
+    def prune_old_messages(self) -> None:
+        cutoff = time.time() - (self.retention_days * 24 * 60 * 60)
+        with self._lock:
+            deleted_messages = self._conn.execute(
+                "DELETE FROM messages WHERE created_at < ?",
+                (cutoff,),
+            ).rowcount
+            deleted_spontaneous = self._conn.execute(
+                "DELETE FROM spontaneous_messages WHERE created_at < ?",
+                (cutoff,),
+            ).rowcount
+            self._conn.commit()
+        logger.info(
+            "Pruned old history: deleted %d regular messages and %d spontaneous messages older than %d days",
+            deleted_messages,
+            deleted_spontaneous,
+            self.retention_days,
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -705,6 +730,7 @@ class IRCBot:
             "isolate_user_context_per_channel": bool(
                 context_cfg.get("isolate_user_context_per_channel", True)
             ),
+            "retention_days": int(context_cfg.get("retention_days", 90)),
         }
 
     def _build_context_store(self, cfg: dict) -> SQLiteContextStore:
@@ -715,6 +741,7 @@ class IRCBot:
             user_history_messages=context_cfg["user_history_messages"],
             channel_history_messages=context_cfg["channel_history_messages"],
             isolate_user_context_per_channel=context_cfg["isolate_user_context_per_channel"],
+            retention_days=context_cfg["retention_days"],
         )
 
     def _reload_spontaneous_config(self, cfg: dict) -> None:
@@ -905,7 +932,9 @@ class IRCBot:
                 user_history_messages=context_cfg["user_history_messages"],
                 channel_history_messages=context_cfg["channel_history_messages"],
                 isolate_user_context_per_channel=context_cfg["isolate_user_context_per_channel"],
+                retention_days=context_cfg["retention_days"],
             )
+            context_store.prune_old_messages()
         self.chatgpt_bot = new_bot
         self.context_store = context_store
         self.config = new_config

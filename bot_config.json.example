@@ -13,7 +13,8 @@
     "database_path": "./context.sqlite3",
     "user_history_messages": 15,
     "channel_history_messages": 100,
-    "isolate_user_context_per_channel": true
+    "isolate_user_context_per_channel": true,
+    "retention_days": 90
   },
   "chat_params": {
     "temperature": 0.9,
