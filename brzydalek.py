@@ -679,6 +679,7 @@ class IRCBot:
         self.channels = config["channels"]
         self.usessl = config["usessl"]
         self.password = config.get("password")
+        self.reply_to_user = self._parse_bool(config.get("replyToUser", True), default=True)
         self.chat_params = config["chat_params"]
         self.context_store = self._build_context_store(config)
         self.chatgpt_bot = ChatGPTBot(
@@ -909,6 +910,7 @@ class IRCBot:
         self.context_store = context_store
         self.config = new_config
         self.nickname = new_config.get("nickname", self.nickname)
+        self.reply_to_user = self._parse_bool(new_config.get("replyToUser", self.reply_to_user), default=self.reply_to_user)
 
         # Join new channels that weren't in the previous config
         new_channels = new_config.get("channels", self.channels)
@@ -1100,12 +1102,27 @@ class IRCBot:
                 return True
         return False
 
+    @staticmethod
+    def _parse_bool(value, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
     def _strip_self_nick_prefix(self, text: str) -> str:
         """Remove leading self nickname formatting like 'brzydalek: ...'."""
         if not text:
             return ""
         pattern = rf"^\s*{re.escape(self.nickname)}\s*[:,\-]\s*"
         return re.sub(pattern, "", text, count=1, flags=re.IGNORECASE).strip()
+
+    def _format_reply_chunk(self, user: str, chunk: str, *, is_private: bool, is_first_chunk: bool) -> str:
+        if is_private or not is_first_chunk or not self.reply_to_user:
+            return chunk
+        return f"{user}: {chunk}"
 
     def split_into_irc_chunks(self, text, max_length):
         """
@@ -1226,7 +1243,7 @@ class IRCBot:
                 self._store_channel_message(channel, user, msg_content)
             if e.reason == "max_output_tokens":
                 reply = random.choice(_TOO_LONG_REPLIES)
-                outgoing = reply if is_private else f"{user}: {reply}"
+                outgoing = self._format_reply_chunk(user, reply, is_private=is_private, is_first_chunk=True)
                 self.send(f"PRIVMSG {channel} :{outgoing}")
             return
         except Exception as e:
@@ -1256,7 +1273,7 @@ class IRCBot:
         all_sent = True
         for i, chunk in enumerate(irc_chunks):
             try:
-                outgoing = f"{user}: {chunk}" if i == 0 and not is_private else chunk
+                outgoing = self._format_reply_chunk(user, chunk, is_private=is_private, is_first_chunk=i == 0)
                 message = f"PRIVMSG {channel} :{outgoing}"
                 self.send(message)
                 if not is_private:

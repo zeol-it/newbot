@@ -4,6 +4,7 @@
   "port": 6697,
   "source_ip": "<my_ipv6/4_address>",
   "nickname": "BotNick",
+  "replyToUser": true,
   "channels": ["#mychannel"],
   "usessl": true,
   "password": null,
