@@ -37,5 +37,10 @@
       "similarity_lookback": 12,
       "prompt": "Wtrąć się do rozmowy jak zwykły uczestnik kanału. Nawiąż lekko do ostatniego kontekstu, ale bez streszczania rozmowy. Napisz jedną krótką wiadomość: komentarz, żart, obserwację albo krótkie pytanie. Brzmij naturalnie, swobodnie i nieformalnie. Odpowiedz tylko treścią wiadomości."
     }
+  },
+  "midnight_announcement": {
+    "enabled": true,
+    "channel": "#antysmuty",
+    "text": "1st"
   }
 }

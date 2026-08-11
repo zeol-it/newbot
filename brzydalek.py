@@ -20,6 +20,7 @@ import argparse
 import openai
 import sqlite3
 import threading
+from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from collections import defaultdict, deque
 
@@ -393,6 +394,19 @@ class SQLiteContextStore:
             rows = self._conn.execute(" ".join(query), params).fetchall()
         return [row["text"] for row in rows]
 
+    def has_spontaneous_message_since(self, channel: str, text: str, since_timestamp: float) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1
+                FROM spontaneous_messages
+                WHERE channel = ? AND text = ? AND created_at >= ?
+                LIMIT 1
+                """,
+                (channel, text, since_timestamp),
+            ).fetchone()
+        return row is not None
+
 
 # Initialize ChatGPT context per user
 class ChatGPTBot:
@@ -720,6 +734,9 @@ class IRCBot:
         self._spontaneous_cfg: dict = {}   # channel -> cfg dict
         self._spontaneous_next: dict[str, float] = {}  # channel -> next fire timestamp
         self._reload_spontaneous_config(config)
+        self._midnight_cfg: dict | None = None
+        self._midnight_last_sent_day: date | None = None
+        self._reload_midnight_config(config)
 
     def _context_config(self, cfg: dict) -> dict:
         context_cfg = cfg.get("context", {})
@@ -774,6 +791,99 @@ class IRCBot:
                 self._schedule_next(channel, new_cfg[channel])
         self._spontaneous_cfg = new_cfg
         self.logger.info(f"Spontaneous config loaded for channels: {list(new_cfg.keys())}")
+
+    def _reload_midnight_config(self, cfg: dict) -> None:
+        raw: dict = cfg.get("midnight_announcement", {})
+        if not self._parse_bool(raw.get("enabled", False), default=False):
+            self._midnight_cfg = None
+            self._midnight_last_sent_day = None
+            return
+        channel = raw.get("channel", "#antysmuty")
+        text = raw.get("text", "1st")
+        self._midnight_cfg = {
+            "enabled": True,
+            "channel": channel,
+            "text": text,
+        }
+        today = datetime.now().date()
+        start_of_day = datetime.combine(today, datetime.min.time()).timestamp()
+        if self.context_store.has_spontaneous_message_since(channel, text, start_of_day):
+            self._midnight_last_sent_day = today
+        else:
+            self._midnight_last_sent_day = None
+
+    @staticmethod
+    def _next_local_midnight(now: datetime | None = None) -> datetime:
+        current = now or datetime.now()
+        next_day = current.date() + timedelta(days=1)
+        return datetime.combine(next_day, datetime.min.time())
+
+    def _sleep_until_local_time(self, target: datetime) -> None:
+        while True:
+            remaining = (target - datetime.now()).total_seconds()
+            if remaining <= 0:
+                return
+            if remaining > 1:
+                time.sleep(remaining - 1)
+            else:
+                time.sleep(min(0.05, remaining))
+
+    def _send_midnight_announcement(self, target_day: date) -> None:
+        cfg = self._midnight_cfg
+        if not cfg:
+            return
+        channel = cfg["channel"]
+        text = cfg["text"]
+        self.send(f"PRIVMSG {channel} :{text}")
+        self.context_store.add_spontaneous_message(channel, text)
+        self._midnight_last_sent_day = target_day
+
+    def _should_send_midnight_announcement(self, target_day: date, now: datetime | None = None) -> bool:
+        cfg = self._midnight_cfg
+        if not cfg or not cfg.get("enabled"):
+            return False
+
+        current = now or datetime.now()
+        if current.date() != target_day:
+            return False
+        if current.hour != 0 or current.minute != 0 or current.second != 0:
+            return False
+        if self._midnight_last_sent_day == target_day:
+            return False
+
+        start_of_day = datetime.combine(target_day, datetime.min.time()).timestamp()
+        if self.context_store.has_spontaneous_message_since(cfg["channel"], cfg["text"], start_of_day):
+            self._midnight_last_sent_day = target_day
+            return False
+
+        return True
+
+    def _midnight_loop(self) -> None:
+        while True:
+            cfg = self._midnight_cfg
+            if not cfg or not cfg.get("enabled"):
+                time.sleep(60)
+                continue
+
+            target = self._next_local_midnight(datetime.now())
+            self._sleep_until_local_time(target)
+
+            cfg = self._midnight_cfg
+            if not cfg or not cfg.get("enabled"):
+                continue
+            if not self._connected:
+                continue
+
+            now = datetime.now()
+            target_day = target.date()
+
+            if not self._should_send_midnight_announcement(target_day, now=now):
+                continue
+
+            try:
+                self._send_midnight_announcement(target_day)
+            except Exception as e:
+                self.logger.error(f"[MIDNIGHT] Error sending midnight announcement: {e}")
 
     def _schedule_next(self, channel: str, cfg: dict) -> None:
         """Pick and store the next timestamp when a spontaneous message should fire."""
@@ -951,6 +1061,7 @@ class IRCBot:
         self.channels = new_channels
 
         self._reload_spontaneous_config(new_config)
+        self._reload_midnight_config(new_config)
         if context_store is not old_context_store:
             old_context_store.close()
 
@@ -1328,6 +1439,8 @@ class IRCBot:
         # Start spontaneous message background thread
         t = threading.Thread(target=self._spontaneous_loop, daemon=True, name="spontaneous")
         t.start()
+        midnight_thread = threading.Thread(target=self._midnight_loop, daemon=True, name="midnight")
+        midnight_thread.start()
         while True:
             self.connect()
             try:
