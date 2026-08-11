@@ -1,8 +1,10 @@
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import date, datetime
 from pathlib import Path
+from typing import Optional
 
 from brzydalek import IRCBot, SQLiteContextStore
 
@@ -11,12 +13,16 @@ class _FakeSpontaneousStore:
     def __init__(self, already_sent: bool = False) -> None:
         self.already_sent = already_sent
         self.recorded: list[tuple[str, str]] = []
+        self.messages: list[dict[str, object]] = []
 
     def has_spontaneous_message_since(self, channel: str, text: str, since_timestamp: float) -> bool:
         return self.already_sent
 
-    def add_spontaneous_message(self, channel: str, text: str) -> None:
+    def add_spontaneous_message(self, channel: str, text: str, created_at: Optional[float] = None) -> None:
         self.recorded.append((channel, text))
+
+    def add_message(self, **kwargs) -> None:
+        self.messages.append(kwargs)
 
 
 class MidnightAnnouncementTests(unittest.TestCase):
@@ -30,6 +36,9 @@ class MidnightAnnouncementTests(unittest.TestCase):
         bot._midnight_last_sent_day = None
         bot.context_store = store
         bot.sent_messages: list[str] = []
+        bot.nickname = "brzydalek"
+        bot._channel_log_lock = threading.RLock()
+        bot._channel_log_cfg = {"enabled": False, "directory": "./channel_logs"}
         bot.send = lambda message: bot.sent_messages.append(message)
         return bot
 
@@ -70,7 +79,12 @@ class MidnightAnnouncementTests(unittest.TestCase):
 
         self.assertEqual(bot.sent_messages, ["PRIVMSG #antysmuty :1st"])
         self.assertEqual(store.recorded, [("#antysmuty", "1st")])
+        self.assertEqual(len(store.messages), 1)
+        self.assertEqual(store.messages[0]["channel"], "#antysmuty")
+        self.assertEqual(store.messages[0]["nick"], "brzydalek")
+        self.assertEqual(store.messages[0]["text"], "1st")
         self.assertEqual(bot._midnight_last_sent_day, target_day)
+
 
     def test_context_store_marks_message_as_recent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

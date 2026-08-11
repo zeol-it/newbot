@@ -17,12 +17,14 @@ import random
 import signal
 import logging
 import argparse
+import unicodedata
 import openai
 import sqlite3
 import threading
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from collections import defaultdict, deque
+from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -736,6 +738,9 @@ class IRCBot:
         self._reload_spontaneous_config(config)
         self._midnight_cfg: dict | None = None
         self._midnight_last_sent_day: date | None = None
+        self._channel_log_lock = threading.RLock()
+        self._channel_log_cfg: dict[str, object] = {}
+        self._reload_channel_log_config(config)
         self._reload_midnight_config(config)
 
     def _context_config(self, cfg: dict) -> dict:
@@ -760,6 +765,48 @@ class IRCBot:
             isolate_user_context_per_channel=context_cfg["isolate_user_context_per_channel"],
             retention_days=context_cfg["retention_days"],
         )
+
+    def _reload_channel_log_config(self, cfg: dict) -> None:
+        raw: dict = cfg.get("channel_logs", {})
+        enabled = self._parse_bool(raw.get("enabled", False), default=False)
+        directory = raw.get("directory", "./channel_logs")
+        self._channel_log_cfg = {
+            "enabled": enabled,
+            "directory": directory,
+        }
+        if enabled:
+            os.makedirs(os.path.abspath(directory), exist_ok=True)
+
+    @staticmethod
+    def _slugify_log_name(name: str) -> str:
+        normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", normalized).strip("._")
+        return slug or "channel"
+
+    def _channel_log_path(self, channel: str, created_at: float | None = None) -> Path | None:
+        if not self._channel_log_cfg.get("enabled"):
+            return None
+        directory = os.path.abspath(str(self._channel_log_cfg["directory"]))
+        timestamp = datetime.fromtimestamp(created_at if created_at is not None else time.time())
+        channel_dir = Path(directory) / self._slugify_log_name(channel)
+        return channel_dir / f"{timestamp:%Y-%m-%d}.log"
+
+    def _append_channel_log_message(
+        self,
+        channel: str,
+        nick: str,
+        text: str,
+        created_at: float | None = None,
+    ) -> None:
+        path = self._channel_log_path(channel, created_at=created_at)
+        if path is None:
+            return
+        timestamp = datetime.fromtimestamp(created_at if created_at is not None else time.time())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = f"[{timestamp:%H:%M:%S}] <{nick}> {text}\n"
+        with self._channel_log_lock:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
 
     def _reload_spontaneous_config(self, cfg: dict) -> None:
         """Parse per-channel spontaneous message settings from config."""
@@ -834,8 +881,10 @@ class IRCBot:
             return
         channel = cfg["channel"]
         text = cfg["text"]
+        created_at = time.time()
         self.send(f"PRIVMSG {channel} :{text}")
-        self.context_store.add_spontaneous_message(channel, text)
+        self._store_channel_message(channel, self.nickname, text, created_at=created_at)
+        self.context_store.add_spontaneous_message(channel, text, created_at=created_at)
         self._midnight_last_sent_day = target_day
 
     def _should_send_midnight_announcement(self, target_day: date, now: datetime | None = None) -> bool:
@@ -991,15 +1040,7 @@ class IRCBot:
                 irc_chunks = self.split_into_irc_chunks(response, 400)
                 for i, chunk in enumerate(irc_chunks):
                     self.send(f"PRIVMSG {channel} :{chunk}")
-                    self.context_store.add_message(
-                        channel=channel,
-                        user=self.nickname,
-                        nick=self.nickname,
-                        role="assistant",
-                        text=chunk,
-                        is_private=False,
-                        store_in_conversation=False,
-                    )
+                    self._store_channel_message(channel, self.nickname, chunk)
                     if i < len(irc_chunks) - 1:
                         time.sleep(0.5)
                 self.context_store.add_spontaneous_message(channel, response)
@@ -1060,6 +1101,7 @@ class IRCBot:
                     self.send(f"JOIN {channel}")
         self.channels = new_channels
 
+        self._reload_channel_log_config(new_config)
         self._reload_spontaneous_config(new_config)
         self._reload_midnight_config(new_config)
         if context_store is not old_context_store:
@@ -1174,7 +1216,13 @@ class IRCBot:
             return _INJECTION_WARNING + text
         return text
 
-    def _store_channel_message(self, channel: str, nick: str, text: str) -> None:
+    def _store_channel_message(
+        self,
+        channel: str,
+        nick: str,
+        text: str,
+        created_at: float | None = None,
+    ) -> None:
         sanitized_text = text if nick == self.nickname else self.sanitize_prompt(nick, text)
         self.context_store.add_message(
             channel=channel,
@@ -1184,7 +1232,9 @@ class IRCBot:
             text=sanitized_text,
             is_private=False,
             store_in_conversation=False,
+            created_at=created_at,
         )
+        self._append_channel_log_message(channel, nick, text, created_at=created_at)
 
     def _store_conversation_message(
         self,
